@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { resolveYtDlpPath } from '../machugi/yt-dlp-path.js';
+import { ytDlpOptions, youtubeFailure } from '../machugi/yt-dlp-options.js';
 const run = promisify(execFile);
 export function parseYouTubeInput(input) {
   const text = String(input).trim();
@@ -50,7 +51,7 @@ export function createYouTubeSearch({ execute = run, now = Date.now, configuredP
       active++;
       try {
         const executable = resolveYtDlpPath(configuredPath, fileURLToPath(new URL('../../bin/yt-dlp.exe', import.meta.url)));
-        const { stdout } = await execute(executable, ['--ignore-config', '--skip-download', direct ? '--no-playlist' : '--flat-playlist', '--dump-single-json', '--no-warnings', '--socket-timeout', '10', '--', direct ? `https://www.youtube.com/watch?v=${direct.id}` : `ytsearch8:${query}`], { windowsHide: true, signal: job.controller.signal, timeout: 20_000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8' });
+        const { stdout } = await execute(executable, [...ytDlpOptions(), '--skip-download', direct ? '--no-playlist' : '--flat-playlist', '--dump-single-json', '--no-warnings', '--socket-timeout', '10', '--', direct ? `https://www.youtube.com/watch?v=${direct.id}` : `ytsearch8:${query}`], { windowsHide: true, signal: job.controller.signal, timeout: 20_000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8' });
         job.controller.signal.throwIfAborted();
         const data = JSON.parse(stdout);
         const results = (direct ? [data] : data.entries ?? []).filter(v => /^[\w-]{11}$/.test(v.id) && v.availability !== 'private').slice(0, 8).map(v => ({
@@ -61,7 +62,7 @@ export function createYouTubeSearch({ execute = run, now = Date.now, configuredP
         if (cache.size >= 100) cache.delete(cache.keys().next().value);
         cache.set(key, { results, expires: now() + 5 * 60_000 });
         return results;
-      } catch { job.controller.signal.throwIfAborted(); throw new Error('유튜브 검색에 실패했습니다. 잠시 후 재시도하거나 영상 주소를 붙여넣어주세요.'); }
+      } catch (error) { job.controller.signal.throwIfAborted(); throw youtubeFailure(error) || new Error('유튜브 검색에 실패했습니다. 잠시 후 재시도하거나 영상 주소를 붙여넣어주세요.'); }
       finally { active--; }
     })();
     pending.set(key, job);

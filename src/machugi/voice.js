@@ -25,6 +25,7 @@ import { promisify } from "node:util"
 import ffmpegPath from "ffmpeg-static"
 import { AudioUrlCache } from "./audio-url-cache.js"
 import { resolveYtDlpPath } from "./yt-dlp-path.js"
+import { ytDlpOptions, youtubeFailure } from "./yt-dlp-options.js"
 import { clipLoopFilter } from "./audio-loop.js"
 import { monitorPlayback } from "./playback-monitor.js"
 import { ClipCache } from "./clip-cache.js"
@@ -60,8 +61,8 @@ const preparedClips = new ClipCache(async ({ videoId, startSeconds, duration }, 
     audioUrl = await getAudioUrl(videoUrl, { signal })
   } catch (err) {
     signal.throwIfAborted()
-    if (isUnavailableError(err) || unavailableVideos.get(videoUrl) > Date.now()) throw err
-    const source = spawn(YT_DLP_PATH, ["--no-playlist", "-f", "bestaudio", "-o", "-", videoUrl],
+    if (youtubeFailure(err) || isUnavailableError(err) || unavailableVideos.get(videoUrl) > Date.now()) throw err
+    const source = spawn(YT_DLP_PATH, [...ytDlpOptions(), "--no-playlist", "-f", "bestaudio", "-o", "-", videoUrl],
       { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     return encodeClip(["-i", "pipe:0", "-ss", String(startSeconds)], duration, { signal, source })
   }
@@ -296,6 +297,7 @@ async function fetchAudioUrl(videoUrl, signal) {
   console.log(`[v0] yt-dlp: getting audio URL for ${videoUrl}`)
   try {
     const { stdout } = await execFileAsync(YT_DLP_PATH, [
+      ...ytDlpOptions(),
       "--no-playlist",
       "-f", "bestaudio",
       "--get-url",
@@ -307,8 +309,9 @@ async function fetchAudioUrl(videoUrl, signal) {
     console.log(`[v0] yt-dlp: got audio URL in ${Date.now() - startedAt}ms (${url.length} chars)`)
     return url
   } catch (err) {
-    if (!signal?.aborted) console.error(`[v0] yt-dlp --get-url failed:`, err.message)
-    throw err
+    const authError = youtubeFailure(err)
+    if (!signal?.aborted) console.error(`[v0] yt-dlp --get-url failed:`, authError?.message || err.message)
+    throw authError || err
   }
 }
 
@@ -353,7 +356,7 @@ export async function playYouTubeClip(player, { videoId, startSeconds, endSecond
     audioUrl = await getAudioUrl(videoUrl, { signal, priority: true })
   } catch (err) {
     signal?.throwIfAborted()
-    if (isUnavailableError(err) || unavailableVideos.get(videoUrl) > Date.now()) throw err
+    if (youtubeFailure(err) || isUnavailableError(err) || unavailableVideos.get(videoUrl) > Date.now()) throw err
     console.error("[v0] Failed to get audio URL, trying pipe fallback...")
     return playYouTubeClipPipe(player, { videoId, startSeconds, endSeconds, duration, videoUrl, loop, signal })
   }
@@ -388,6 +391,7 @@ function playYouTubeClipPipe(player, { videoId, startSeconds, duration, videoUrl
   console.log(`[v0] voice: pipe fallback for ${videoUrl}`)
 
   const ytdlp = spawn(YT_DLP_PATH, [
+    ...ytDlpOptions(),
     "--no-playlist",
     "-f", "bestaudio",
     "-o", "-",

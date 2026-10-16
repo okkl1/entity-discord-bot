@@ -480,10 +480,13 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
       reply(200, staticFiles.get(asset[0]), asset[1]);
     } catch (error) {
       if (res.destroyed) return;
-      console.warn('[web] request failed:', error.message);
+      const kind = /\/tracks(?:\?|$)/.test(req.url) ? 'flac-search'
+        : /\/videos(?:\?|$)/.test(req.url) ? 'youtube-search'
+        : /\/quizzes(?:\?|$)/.test(req.url) ? 'quiz-search' : 'request';
+      console.warn(`[web] ${kind} failed:`, error.name === 'TimeoutError' ? 'upstream timeout' : error.code || 'upstream error');
       const trackRequest = /\/tracks(?:\?|$)/.test(req.url);
       if (res.headersSent) return res.end(JSON.stringify({ type: 'error', error: error.message }) + '\n');
-      reply(502, { error: trackRequest ? error.message : '검색 서비스에 연결하지 못했습니다. 잠시 후 다시 시도하거나 유튜브 주소를 입력해주세요.' });
+      reply(502, { error: trackRequest || error.code === 'YOUTUBE_AUTH_REQUIRED' ? error.message : '검색 서비스에 연결하지 못했습니다. 잠시 후 다시 시도하거나 유튜브 주소를 입력해주세요.' });
     }
   });
   server.requestTimeout = 20_000;

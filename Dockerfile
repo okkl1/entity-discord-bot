@@ -16,7 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgssapi-krb5-2 zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/yt-dlp \
-    && /opt/yt-dlp/bin/pip install --no-cache-dir yt-dlp
+    && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp[default]" \
+    && /opt/yt-dlp/bin/yt-dlp --version \
+    && /opt/yt-dlp/bin/pip show yt-dlp-ejs >/dev/null
 WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY --from=slskd_binary /slskd /opt/slskd

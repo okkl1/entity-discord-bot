@@ -24,6 +24,7 @@ async function getJson(path, fetchImpl = fetch) {
   } catch (error) {
     throw new Error(`바이낸스 연결에 실패했습니다: ${error.message}`);
   }
+  if (response.status === 451) throw new Error('바이낸스가 이 서버의 접속을 제한했습니다 (HTTP 451). 배포 지역과 Binance 이용 가능 여부를 확인해주세요.');
   if (!response.ok) throw new Error(`바이낸스가 HTTP ${response.status} 오류를 반환했습니다.`);
   return response.json();
 }

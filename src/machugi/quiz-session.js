@@ -555,6 +555,11 @@ export class QuizSession {
     } catch (err) {
       if (controller.signal.aborted) return
       this.playbackFailures++
+      if (err.code === "YOUTUBE_AUTH_REQUIRED") {
+        this.playbackError = err.message
+        this.stopped = true
+        this.cancelPrefetch()
+      }
       console.error("[v0] clip error:", err)
       void this.editPanel({
         embeds: [new EmbedBuilder().setColor(0xef4444)
@@ -772,13 +777,13 @@ export class QuizSession {
       playbackFailures: this.playbackFailures, stopped: this.stopped })
     const sorted = [...this.scores.entries()].sort((a, b) => b[1].points - a[1].points)
     const playbackFailed = this.playedRounds === 0 && this.playbackFailures > 0
-    let desc = playbackFailed
+    let desc = this.playbackError || (playbackFailed
       ? `**${this.playbackFailures}문제 모두 오디오 재생에 실패했습니다.**\n재생 도구 경로, 영상 상태 또는 네트워크를 확인해주세요. 상세 원인은 봇 실행 창에 표시됩니다.`
       : sorted.length === 0
       ? "아무도 정답을 맞추지 못했어요."
       : sorted.slice(0, 10).map(([, v], i) =>
           `${["🥇", "🥈", "🥉"][i] ?? `${i + 1}위.`} **${v.name}**  ${v.points}점`
-        ).join("\n")
+        ).join("\n"))
     if (!playbackFailed && this.playbackFailures > 0) {
       desc += `\n\n⚠️ 재생 실패로 ${this.playbackFailures}문제를 건너뛰었습니다.`
     }

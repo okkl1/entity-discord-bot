@@ -7,10 +7,20 @@ import ffmpegPath from "ffmpeg-static"
 import { AudioPlayerStatus, entersState } from "@discordjs/voice"
 import { performance } from "node:perf_hooks"
 
-let fixtureUrl, lookups = 0
+let fixtureUrl, lookups = 0, lookupError, pipeFallbacks = 0
 const lookup = () => { throw Error("unexpected callback API") }
-lookup[promisify.custom] = async () => { lookups++; return { stdout: fixtureUrl, stderr: "" } }
-mock.module("node:child_process", { namedExports: { ...childProcess, execFile: lookup } })
+lookup[promisify.custom] = async (_, args) => {
+  lookups++
+  assert.equal(args[args.indexOf('--js-runtimes') + 1], `node:${process.execPath}`)
+  if (lookupError) throw lookupError
+  return { stdout: fixtureUrl, stderr: "" }
+}
+mock.module("node:child_process", { namedExports: { ...childProcess, execFile: lookup,
+  spawn: (file, args, options) => {
+    if (file === process.env.YT_DLP_PATH) pipeFallbacks++
+    return childProcess.spawn(file, args, options)
+  },
+} })
 const { prefetchQuizClip, playYouTubeClip, createPlayer, pausePlayer, resumePlayer } = await import("../src/machugi/voice.js")
 
 test("prepared clips play, loop, pause and replace on the real Discord audio player", async () => {
@@ -61,4 +71,13 @@ test("prepared clips play, loop, pause and replace on the real Discord audio pla
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))
   }
+})
+
+test("server bot verification does not repeat the same blocked request through pipe fallback", async () => {
+  lookupError = Object.assign(new Error('blocked'), { stderr: 'Sign in to confirm you’re not a bot.' })
+  const player = createPlayer()
+  try {
+    await assert.rejects(playYouTubeClip(player, { videoId: 'blocked-fixture', startSeconds: 0, endSeconds: 12, loop: true }), { code: 'YOUTUBE_AUTH_REQUIRED' })
+    assert.equal(pipeFallbacks, 0)
+  } finally { lookupError = null; player.stop(true) }
 })

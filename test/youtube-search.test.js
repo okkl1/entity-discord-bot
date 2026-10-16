@@ -24,6 +24,20 @@ test('YouTube inputs accept official video links and timestamps, reject foreign 
   assert.equal(parseYouTubeInput('file:///M7lc1UVf-VE'), null);
   assert.equal(parseYouTubeInput('https://youtu.be/invalid'), null);
 });
+
+test('metadata extraction enables Node and explains server bot verification without leaking stderr', async () => {
+  const search = createYouTubeSearch({ execute: async (_, args) => {
+    const runtimeIndex = args.indexOf('--js-runtimes');
+    assert.ok(runtimeIndex >= 0);
+    assert.equal(args[runtimeIndex + 1], `node:${process.execPath}`);
+    throw Object.assign(new Error('private command'), { stderr: 'Sign in to confirm you’re not a bot. private diagnostics' });
+  } });
+  await assert.rejects(search('example'), error => {
+    assert.equal(error.code, 'YOUTUBE_AUTH_REQUIRED');
+    assert.doesNotMatch(error.message, /private/);
+    return true;
+  });
+});
 test('metadata search uses argument arrays, bounded subprocess, safe public fields and cache', async () => {
   let calls = 0, time = 0;
   const search = createYouTubeSearch({ now: () => time, execute: async (file, args, options) => {

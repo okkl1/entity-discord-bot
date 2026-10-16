@@ -160,6 +160,17 @@ test("skip/stop also advance the answer screen and full-song playback", () => {
   session.destroy()
 })
 
+test("server YouTube verification stops the quiz and explains the configuration issue", async () => {
+  const { session, edits } = setup()
+  nextClip = Object.assign(new Error("YT_DLP_COOKIES_FILE 설정을 확인해주세요."), { code: "YOUTUBE_AUTH_REQUIRED" })
+  await session.runRound(1, { video_id: "blocked", answer: ["정답"] })
+  assert.equal(session.stopped, true)
+  assert.equal(session.current, null)
+  await session.showResults()
+  assert.match(edits.at(-1).embeds[0].data.description, /YT_DLP_COOKIES_FILE/)
+  session.destroy()
+})
+
 test("startup and mid-round audio failures advance without revealing an answer", async () => {
   const { session, edits } = setup()
   const question = { video_id: "deleted", answer: ["정답"] }

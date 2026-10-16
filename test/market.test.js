@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { formatPrice, getPrice, normalizeSymbol, parseSymbols, validateSymbols } from '../src/binance/market.js';
 
+test('451 explains deployment access restrictions without returning another market as a substitute', async () => {
+  let calls = 0;
+  await assert.rejects(getPrice('BTCUSDT', async () => { calls++; return { ok: false, status: 451 }; }), /서버의 접속을 제한.*451/);
+  assert.equal(calls, 1);
+});
+
 test('종목 입력을 정리하고 중복 및 개수 제한을 적용한다', () => {
   assert.equal(normalizeSymbol('btc/usdt'), 'BTCUSDT');
   assert.deepEqual(parseSymbols('BTC, ethusdt BTCUSDT'), ['BTCUSDT', 'ETHUSDT']);
