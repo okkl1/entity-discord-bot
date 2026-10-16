@@ -23,6 +23,12 @@ let socket, joined = false, host = false, state, revision = -1, offset = 0, best
 let player, playerReady = false, videoKey = '', noticeTimer, reconnectTimer, searchController;
 let videoSoundEnabled = true, videoAutoplayBlocked = false, videoWasPaused = false;
 let youtubeController, trackController, matchController, matchingAction, matchingSource;
+let pendingPause;
+function clearPendingPause() { if (pendingPause) clearTimeout(pendingPause.timer); pendingPause = null; }
+function localPlaybackState(value) {
+  return pendingPause?.paused && pendingPause.roundId === value?.roundId
+    ? { ...value, paused: true, audio: value.audio ? { ...value.audio, pausedAt: pendingPause.at } : null } : value;
+}
 let losslessConfigured = false, losslessPrepared = false;
 const trackCards = new Map();
 let mode = new URLSearchParams(location.search).get('mode') === 'watch' ? 'watch' : 'quiz';
@@ -97,6 +103,7 @@ function applyState(next) {
   const roundChanged = !state || next.roundId !== state.roundId;
   const answerWasDisabled = $('answer').disabled;
   const phaseChanged = next.phase !== state?.phase;
+  if (pendingPause && (next.roundId !== pendingPause.roundId || (next.revision > pendingPause.revision && Boolean(next.paused) === pendingPause.paused))) clearPendingPause();
   if (matchingSource && (next.phase !== 'watch' || next.roundId !== matchingSource.sourceRoundId)) matchController?.abort();
   revision = next.revision;
   if (roundChanged) { $('chat').replaceChildren(textElement('p', '떠오르는 제목을 가장 먼저 입력해보세요.', 'chat-empty')); $('answer').value = ''; }
@@ -110,6 +117,7 @@ function applyState(next) {
   $('skip').disabled = !active;
   $('skip').hidden = $('fullplay').hidden = ['watch', 'listen'].includes(next.phase);
   $('pause').disabled = !joined || Boolean(next.buffering) || !['question', 'reveal', 'fullplay', 'watch', 'listen'].includes(next.phase) || (next.phase === 'listen' && !next.audio?.startedAt); $('pause').textContent = next.paused ? '재생 재개' : '재생 정지';
+  if (pendingPause) { $('pause').disabled = true; $('pause').textContent = pendingPause.paused ? '정지 반영 중…' : '재개 반영 중…'; }
   $('stop').disabled = !joined || (!next.preparing && !['loading', 'question', 'reveal', 'fullplay', 'watch', 'listen'].includes(next.phase));
   $('stop').textContent = next.phase === 'listen' ? '음악 감상 종료' : next.phase === 'watch' ? '함께 보기 종료' : '게임 종료';
   $('next-track').hidden = !['listen', 'watch'].includes(next.phase);
@@ -143,7 +151,7 @@ function applyState(next) {
   $('stage-description').textContent = next.preparingKind === 'listen' ? '선택한 FLAC을 임시 캐시에 준비하고 있어요. 전송과 음원 확인을 마치면 함께 시작합니다.' : next.phase === 'listen' ? next.buffering ? '음원을 더 받은 뒤 같은 위치에서 함께 재개합니다.' : 'FLAC 원본으로 함께 듣습니다. 곡을 바꾸거나 감상을 끝내면 캐시는 자동 삭제됩니다.' : next.phase === 'watch' ? '참가자의 정지·재개·위치 변경을 함께 반영합니다. 각 브라우저의 재생 지연은 자동으로 보정해요.' : descriptions[next.phase] || '';
   $('youtube-link').hidden = !next.video;
   if (next.video) $('youtube-link').href = `https://www.youtube.com/watch?v=${encodeURIComponent(next.video.id)}&t=${Math.floor(next.video.startSeconds)}s`;
-  renderScores(next.scores || []); renderQueue(next.queue || []); syncVideo(); losslessPlayer.update(joined ? next : { phase: 'waiting' }); updateTimer();
+  renderScores(next.scores || []); renderQueue(next.queue || []); syncVideo(); losslessPlayer.update(joined ? localPlaybackState(next) : { phase: 'waiting' }); updateTimer();
   if (answering && (answerWasDisabled || roundChanged)) $('answer').focus({ preventScroll: true });
 }
 function updateTimer() {
@@ -169,6 +177,7 @@ function writeTimer(label, percent) {
 function syncVideo() {
   if (!playerReady) return;
   if (!state?.video) { if (videoKey) { player.mute(); player.stopVideo(); } videoKey = ''; videoAutoplayBlocked = false; videoWasPaused = false; return; }
+  if (pendingPause?.paused && pendingPause.roundId === state.roundId) { player.pauseVideo(); return; }
   if (browserAudioAllowed() && videoSoundEnabled) {
     if (player.isMuted()) player.unMute();
   } else if (!player.isMuted()) player.mute();
@@ -199,7 +208,7 @@ function prepareVideo() {
       onError: () => { $('video-error').hidden = false; },
       onStateChange: event => {
         if (!browserAudioAllowed()) player.mute();
-        if (event.data === 1 && state?.paused) player.pauseVideo();
+        if (event.data === 1 && (state?.paused || (pendingPause?.paused && pendingPause.roundId === state?.roundId))) player.pauseVideo();
         if (event.data === 0 && state?.phase === 'watch' && player.getVideoData().video_id === state.video.id && (state.video.duration || videoPosition() > 2)) send({ type: 'watchEnded', roundId: state.roundId, phase: 'watch' });
       },
       onAutoplayBlocked: () => {
@@ -244,10 +253,11 @@ function connect() {
       const rtt = Date.now() - msg.sentAt;
       if (rtt <= bestRtt + 20) { bestRtt = Math.min(bestRtt, rtt); offset = msg.serverTime - (msg.sentAt + Date.now()) / 2; }
     } else if (msg.type === 'queueAck') notify(`${msg.title} · 다음 곡으로 예약했어요.`);
-    else if (msg.type === 'error') { notify(msg.message); if (state) applyState(state); }
+    else if (msg.type === 'error') { clearPendingPause(); notify(msg.message); if (state) applyState(state); }
   };
   ws.onclose = event => {
     if (socket !== ws) return;
+    clearPendingPause();
     joined = false; $('connection').textContent = '연결 끊김 · 재접속 중'; $('connection').className = 'connection offline';
     player?.mute();
     losslessPlayer.pause();
@@ -285,13 +295,20 @@ async function searchQuizzes() {
 }
 async function searchYouTube() {
   youtubeController?.abort(); youtubeController = new AbortController();
+  const controller = youtubeController;
   $('youtube-results').replaceChildren(textElement('p', '유튜브 영상을 찾는 중…', 'small'));
   try {
-    const response = await fetch(`/api/rooms/${roomId}/videos?q=${encodeURIComponent($('youtube-search').value)}`, { signal: youtubeController.signal });
-    const data = await readApiResponse(response);
+    const response = await fetch(`/api/rooms/${roomId}/videos?q=${encodeURIComponent($('youtube-search').value)}`, { signal: controller.signal, headers: { Accept: 'application/x-ndjson' } });
+    const data = await readTrackSearchResponse(response, { signal: controller.signal, onProgress: data => {
+      if (youtubeController === controller && data.hits.length) renderVideos(data.hits);
+    } });
+    if (youtubeController === controller) renderVideos(data.hits);
+  } catch (error) { if (error.name !== 'AbortError' && youtubeController === controller) $('youtube-results').replaceChildren(textElement('p', error.message, 'small')); }
+}
+function renderVideos(hits) {
     $('youtube-results').replaceChildren();
-    if (!data.hits.length) $('youtube-results').append(textElement('p', '검색 결과가 없어요. 영상 주소도 사용할 수 있어요.', 'small'));
-    for (const video of data.hits) {
+    if (!hits.length) $('youtube-results').append(textElement('p', '검색 결과가 없어요. 영상 주소도 사용할 수 있어요.', 'small'));
+    for (const video of hits) {
       const card = textElement('div', '', 'quiz-option video-option');
       const img = document.createElement('img'); img.src = video.thumbnail; img.alt = ''; img.loading = 'lazy';
       card.append(img, textElement('strong', video.title), textElement('small', video.channel));
@@ -304,11 +321,11 @@ async function searchYouTube() {
       }
       card.append(actions); $('youtube-results').append(card);
     }
-  } catch (error) { if (error.name !== 'AbortError') $('youtube-results').replaceChildren(textElement('p', error.message, 'small')); }
 }
 async function searchTracks() {
   trackController?.abort(); trackController = new AbortController();
   const controller = trackController;
+  let hasHits = false;
   clearTrackResults('Soulseek에서 FLAC를 찾는 중… 첫 연결은 조금 더 걸릴 수 있어요.');
   $('track-search-status').textContent = '검색 중… 결과가 도착하는 대로 표시합니다.';
   try {
@@ -316,7 +333,7 @@ async function searchTracks() {
     const response = await fetch(`/api/rooms/${roomId}/tracks?${params}`, {
       signal: controller.signal, headers: { Accept: 'application/x-ndjson' } });
     const data = await readTrackSearchResponse(response, { signal: controller.signal, onProgress: data => {
-      if (data.hits.length) renderTrackResults(data.hits);
+      if (data.hits.length) { hasHits = true; renderTrackResults(data.hits); }
       $('track-search-status').textContent = data.hits.length ? `${data.hits.length}개 도착 · 바로 선택할 수 있어요. 추가 검색 중…`
         : data.stage === 'identity' ? '검색할 가수·곡명을 확인하는 중…'
         : data.stage === 'related' ? '더 관련 있는 곡을 찾기 위해 곡명·가수·핵심 단어로 연관 검색 중…'
@@ -328,7 +345,12 @@ async function searchTracks() {
     const expanded = data.stage === 'related' ? ' · 연관 검색 포함' : '';
     $('track-search-status').textContent = data.hits.length ? `${data.hits.length}개 검색 완료${expanded}`
       : `제목·연관 검색 ${data.searchedQueries?.length || 1}개에서 응답한 공유자의 FLAC 후보를 찾지 못했어요. 다른 곡명 표기나 가수명으로 검색해보세요.`;
-  } catch (error) { if (error.name !== 'AbortError' && trackController === controller) $('track-search-status').textContent = error.message; }
+  } catch (error) {
+    if (error.name !== 'AbortError' && trackController === controller) {
+      $('track-search-status').textContent = error.message;
+      if (!hasHits) clearTrackResults('검색을 완료하지 못했습니다. 다시 시도해주세요.');
+    }
+  }
 }
 function showMusicIdentity(identity) {
   $('track-identity').hidden = !identity;
@@ -443,7 +465,18 @@ $('answer-form').onsubmit = event => {
   }
 };
 function control(type) {
-  if (type === 'stop') matchController?.abort();
+  if (type === 'pause') {
+    if (!state || pendingPause) return;
+    const paused = !state.paused;
+    if (!send({ type, paused, roundId: state.roundId, phase: state.phase })) return;
+    pendingPause = { paused, roundId: state.roundId, revision, at: now(), timer: setTimeout(() => {
+      clearPendingPause(); notify('재생 제어 응답이 지연되고 있어요. 연결 상태를 확인하고 다시 눌러주세요.'); if (state) applyState(state);
+    }, 5000) };
+    $('pause').disabled = true; $('pause').textContent = paused ? '정지 반영 중…' : '재개 반영 중…';
+    if (paused) { if (playerReady) player.pauseVideo(); losslessPlayer.update(localPlaybackState(state)); }
+    return;
+  }
+  if (type === 'stop') { clearPendingPause(); youtubeController?.abort(); trackController?.abort(); matchController?.abort(); }
   if (send({ type, roundId: state?.roundId, phase: state?.phase }) && ['skip', 'fullplay', 'stop'].includes(type)) { player?.mute(); playerReady && player.pauseVideo(); }
   if (type === 'stop') losslessPlayer.pause();
 }
@@ -465,7 +498,7 @@ window.addEventListener('keydown', event => {
   if (event.repeat || $('skip').disabled) return;
   control('skip');
 }, { capture: true });
-setInterval(() => { if (!document.hidden) updateTimer(); }, 250); setInterval(() => { syncVideo(); if (joined && state?.phase === 'listen') losslessPlayer.update(state); }, 2000);
+setInterval(() => { if (!document.hidden) updateTimer(); }, 250); setInterval(() => { syncVideo(); if (joined && state?.phase === 'listen') losslessPlayer.update(localPlaybackState(state)); }, 2000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { syncVideo(); updateTimer(); } });
 window.addEventListener('pagehide', () => { player?.mute(); losslessPlayer.pause(); socket?.close(); });
 setInterval(() => { if (joined && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping', sentAt: Date.now() })); }, 10_000);

@@ -26,6 +26,11 @@ function requestError(status, body, path) {
 }
 const searchErrored = status => typeof status?.state === 'number' ? Boolean(status.state & 128)
   : /(?:^|[,\s])Errored(?:$|[,\s])/i.test(String(status?.state ?? ''));
+const requestStage = path => path === '/server' ? 'login' : path === '/application' ? 'startup'
+  : path === '/searches' ? 'search-create' : path.endsWith('/responses') ? 'search-results'
+  : path.startsWith('/searches/') ? 'search-state' : path.startsWith('/transfers/') ? 'transfer' : 'service';
+const stageLabel = stage => ({ login: '로그인 상태 확인', startup: '프로그램 시작 확인',
+  'search-create': '검색 요청', 'search-results': '검색 결과 수신', 'search-state': '검색 상태 확인', transfer: '음원 전송 확인' })[stage] || '응답 확인';
 
 export function normalizeTracks(responses) {
   const hits = [], seen = new Set();
@@ -52,7 +57,7 @@ export function normalizeTracks(responses) {
 export class SoulseekClient {
   constructor({ baseUrl, apiKey, fetchImpl = fetch, searchMs = 7000, extendedSearchMs = searchMs * 2, pollMs = 250,
     minSearchMs = 1500, settleMs = 500, minHits = 10, matchMs = 500,
-    now = Date.now, sleep = delay, searchEvents, loginFailure = async () => null }) {
+    now = Date.now, sleep = delay, searchEvents, loginFailure = async () => null, loginWaitMs = 20_000 }) {
     this.baseUrl = baseUrl.replace(/\/$/, ''); this.apiKey = apiKey; this.fetch = fetchImpl; this.searchMs = searchMs;
     this.extendedSearchMs = Math.max(searchMs, extendedSearchMs);
     this.pollMs = pollMs; this.minSearchMs = minSearchMs; this.settleMs = settleMs; this.minHits = minHits; this.matchMs = matchMs;
@@ -60,28 +65,60 @@ export class SoulseekClient {
     this.searchEvents = searchEvents === false ? null : searchEvents ?? createSoulseekSearchEvents({ baseUrl: this.baseUrl, apiKey });
     this.posts = Promise.resolve(); this.cleanups = new Set();
     this.loginFailure = loginFailure;
+    this.loginWaitMs = loginWaitMs;
   }
   get searching() { return this.pending.values().next().value ?? null; }
   async request(path, { method = 'GET', body, signal, timeoutMs = 45_000 } = {}) {
     // Retry only search reads. A failed POST may already have created a native
     // search or transfer, so replaying mutations could duplicate the operation.
-    const readAttempts = method === 'GET' && path.startsWith('/searches/') ? 2 : 1;
+    const readAttempts = method === 'GET' && (path.startsWith('/searches/') || path === '/server') ? 2 : 1;
     for (let attempt = 0; attempt < readAttempts; attempt++) {
-      const response = await this.fetch(`${this.baseUrl}/api/v0${path}`, { method,
-        headers: { 'X-API-Key': this.apiKey, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.any([this.controller.signal, AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]) });
+      const timeout = AbortSignal.timeout(timeoutMs);
+      const combined = AbortSignal.any([this.controller.signal, timeout, ...(signal ? [signal] : [])]);
+      let response, text;
+      try {
+        response = await this.fetch(`${this.baseUrl}/api/v0${path}`, { method,
+          headers: { 'X-API-Key': this.apiKey, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+          body: body ? JSON.stringify(body) : undefined, signal: combined });
+        text = await response.text();
+      } catch (error) {
+        this.controller.signal.throwIfAborted(); signal?.throwIfAborted();
+        if (attempt + 1 < readAttempts) {
+          await this.sleep(150, undefined, { signal: AbortSignal.any([this.controller.signal, ...(signal ? [signal] : [])]) }); continue;
+        }
+        const stage = requestStage(path), timedOut = timeout.aborted || error.name === 'TimeoutError';
+        throw Object.assign(new Error(timedOut
+          ? `Soulseek ${stageLabel(stage)} 시간이 초과됐습니다. 연결 프로그램이 지연되고 있습니다. 잠시 후 다시 시도해주세요.`
+          : `Soulseek ${stageLabel(stage)} 중 연결이 끊겼습니다. 봇의 연결 상태를 확인한 뒤 다시 시도해주세요.`),
+          { kind: timedOut ? 'local_timeout' : 'local_connection', stage, code: timedOut ? 'SOULSEEK_LOCAL_TIMEOUT' : 'SOULSEEK_LOCAL_CONNECTION' });
+      }
       if (!response.ok) {
-        const details = await response.text().catch(() => '');
         if (response.status >= 500 && attempt + 1 < readAttempts) {
           await this.sleep(150, undefined, { signal: AbortSignal.any([this.controller.signal, ...(signal ? [signal] : [])]) }); continue;
         }
-        throw requestError(response.status, details, path);
+        throw Object.assign(requestError(response.status, text, path), { stage: requestStage(path) });
       }
-      const text = await response.text();
       try { return text ? JSON.parse(text) : null; }
       catch { throw new Error('Soulseek 연결 프로그램의 응답을 읽지 못했습니다. 봇을 재시작한 뒤 다시 검색해주세요.'); }
     }
+  }
+  async waitForLogin(signal) {
+    const deadline = this.now() + this.loginWaitMs;
+    let lastError;
+    while (this.now() < deadline) {
+      try {
+        const status = await this.request('/server', { signal, timeoutMs: Math.max(1, Math.min(3000, Math.floor((deadline - this.now()) / 2))) });
+        if (status?.isLoggedIn) return;
+      } catch (error) {
+        if (!['local_timeout', 'local_connection'].includes(error.kind) && !(error.status >= 500)) throw error;
+        lastError = error;
+      }
+      const failure = await this.loginFailure(); if (failure) throw new Error(failure);
+      const remaining = deadline - this.now(); if (remaining <= 0) break;
+      await this.sleep(Math.min(500, remaining), undefined, { signal });
+    }
+    if (lastError) throw lastError;
+    throw Object.assign(new Error('Soulseek에 로그인하지 못했습니다. SOULSEEK_USERNAME / SOULSEEK_PASSWORD 설정과 서버 연결을 확인해주세요.'), { kind: 'login', stage: 'login', code: 'SOULSEEK_LOGIN_TIMEOUT' });
   }
   async search(query, { signal, acceptHits, hasRelevantHits, onProgress, searchTimeoutMs } = {}) {
     signal?.throwIfAborted(); this.controller.signal.throwIfAborted();
@@ -133,12 +170,7 @@ export class SoulseekClient {
     try {
       signal.throwIfAborted();
       // The local API can become ready before the Soulseek login finishes.
-      const deadline = this.now() + 15_000;
-      while (!(await this.request('/server', { signal, timeoutMs: 3000 }))?.isLoggedIn) {
-        const failure = await this.loginFailure(); if (failure) throw new Error(failure);
-        if (this.now() > deadline) throw new Error('Soulseek에 로그인하지 못했습니다. 계정 설정과 인터넷 연결을 확인한 뒤 다시 검색해주세요.');
-        await this.sleep(500, undefined, { signal });
-      }
+      await this.waitForLogin(signal);
       unsubscribe = await this.searchEvents?.subscribe(id, peer => {
         if (!peer?.username || !Array.isArray(peer.files) || responses.size >= 250 && !responses.has(peer.username)) return;
         responses.set(peer.username, peer); changedAt = this.now(); responseRevision++;

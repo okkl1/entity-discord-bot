@@ -2,6 +2,51 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SoulseekClient } from '../src/web/soulseek-client.js';
 
+test('transient local read timeouts retry once; timed-out mutations are not duplicated', async () => {
+  let calls = 0;
+  const client = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false, sleep: async () => {},
+    fetchImpl: async () => { if (++calls === 1) throw new DOMException('private path', 'TimeoutError'); return new Response('{"isLoggedIn":true}'); } });
+  try { assert.deepEqual(await client.request('/server'), { isLoggedIn: true }); assert.equal(calls, 2); }
+  finally { client.close(); }
+  calls = 0;
+  const failing = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false,
+    fetchImpl: async () => { calls++; throw new DOMException('private credentials', 'TimeoutError'); } });
+  try {
+    await assert.rejects(failing.request('/searches', { method: 'POST' }), error => {
+      assert.equal(error.code, 'SOULSEEK_LOCAL_TIMEOUT'); assert.equal(error.stage, 'search-create');
+      assert.match(error.message, /검색 요청 시간이 초과/); assert.doesNotMatch(error.message, /private|credentials|aborted/); return true;
+    }); assert.equal(calls, 1);
+  } finally { failing.close(); }
+});
+
+test('body-read timeouts identify their stage and a caller cancellation is never retried', async () => {
+  let calls = 0;
+  const client = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false, sleep: async () => {},
+    fetchImpl: async () => { calls++; return { ok: true, text: async () => { throw new DOMException('private', 'TimeoutError'); } }; } });
+  try { await assert.rejects(client.request('/searches/id/responses'), error => error.stage === 'search-results' && error.kind === 'local_timeout'); assert.equal(calls, 2); }
+  finally { client.close(); }
+  const controller = new AbortController(); calls = 0;
+  const cancelled = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false,
+    fetchImpl: async () => { calls++; controller.abort(); throw controller.signal.reason; } });
+  try { await assert.rejects(cancelled.request('/server', { signal: controller.signal }), { name: 'AbortError' }); assert.equal(calls, 1); }
+  finally { cancelled.close(); }
+});
+
+test('cold login checks recover after a timeout but repeated local failure has a bounded deadline', async () => {
+  let time = 0, calls = 0;
+  const client = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false, loginWaitMs: 1000,
+    now: () => time, sleep: async ms => { time += ms; }, fetchImpl: async () => {
+      if (++calls <= 2) throw new DOMException('private', 'TimeoutError'); return new Response('{"isLoggedIn":true}');
+    } });
+  try { await client.waitForLogin(); assert.equal(calls, 3); assert.ok(time <= 1000); }
+  finally { client.close(); }
+  time = 0;
+  const failing = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false, loginWaitMs: 1000,
+    now: () => time, sleep: async ms => { time += ms; }, fetchImpl: async () => { throw new DOMException('private', 'TimeoutError'); } });
+  try { await assert.rejects(failing.waitForLogin(), error => error.code === 'SOULSEEK_LOCAL_TIMEOUT' && error.stage === 'login'); assert.ok(time <= 1000); }
+  finally { failing.close(); }
+});
+
 test('a timed-out peer lookup is identified as a transfer failure and never replays its enqueue', async () => {
   let calls = 0;
   const client = new SoulseekClient({ baseUrl: 'http://localhost', apiKey: 'test', searchEvents: false,

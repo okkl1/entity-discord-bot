@@ -2,6 +2,34 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createYouTubeSearch, parseYouTubeInput } from '../src/web/youtube-search.js';
 
+test('YouTube choices arrive before extraction completes and shared cancellation preserves another browser', async () => {
+  let finish, options;
+  const search = createYouTubeSearch({ execute: (_, args, settings) => {
+    assert.ok(args.includes('--dump-json')); assert.ok(args.includes('--lazy-playlist'));
+    options = settings;
+    return new Promise(resolve => { finish = () => resolve({ stdout: '' }); });
+  } });
+  const controller = new AbortController(), early = [], late = [];
+  const first = search('shared stream', { signal: controller.signal, onProgress: hits => early.push(hits.length) });
+  options.onEntry({ id: 'M7lc1UVf-VE', title: 'first', private: 'hidden' });
+  assert.deepEqual(early, [1]);
+  const second = search('shared stream', { onProgress: hits => late.push(hits.length) });
+  assert.deepEqual(late, [1]);
+  controller.abort(); await assert.rejects(first, { name: 'AbortError' });
+  assert.equal(options.signal.aborted, false);
+  options.onEntry({ id: 'abcdefghijk', title: 'second' });
+  assert.deepEqual(early, [1]); assert.deepEqual(late, [1, 2]);
+  finish(); const results = await second;
+  assert.equal(results.length, 2); assert.equal(results[0].private, undefined);
+});
+
+test('a partial YouTube search remains usable if later extraction times out', async () => {
+  const search = createYouTubeSearch({ execute: async (_, args, { onEntry }) => {
+    onEntry({ id: 'M7lc1UVf-VE', title: 'first' }); throw Object.assign(new Error('private diagnostics'), { killed: true });
+  } });
+  assert.equal((await search('partial'))[0].title, 'first');
+});
+
 test('cancelling one shared metadata lookup preserves the other caller, and cancels the process when all callers leave', async () => {
   let finish, currentSignal;
   const search = createYouTubeSearch({ execute: (file, args, { signal }) => new Promise((resolve, reject) => {

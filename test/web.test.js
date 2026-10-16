@@ -45,6 +45,54 @@ async function fixture(overrides = {}) {
   return { web, base, links, join, params, events, async close() { for (const ws of clients) ws.terminate(); await web.close(); } };
 }
 
+test('streamed YouTube choices are playable before completion and browser cancellation reaches the extractor', async () => {
+  let searchSignal, finish;
+  const f = await fixture({ videoSearch: async (q, { signal, onProgress }) => {
+    searchSignal = signal;
+    onProgress([{ id: 'M7lc1UVf-VE', title: 'First choice', private: 'hidden' }]);
+    return new Promise((resolve, reject) => {
+      finish = resolve; signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  } });
+  const controller = new AbortController(); let reading;
+  try {
+    const host = await f.join({ host: true });
+    let gotFirst; const first = new Promise(resolve => { gotFirst = resolve; });
+    const response = await fetch(`${f.base}/api/rooms/${f.links.id}/videos?q=first`, { signal: controller.signal, headers: { Accept: 'application/x-ndjson' } });
+    reading = readTrackSearchResponse(response, { signal: controller.signal, onProgress: data => { if (data.hits.length) gotFirst(data); } });
+    const settled = reading.catch(error => error);
+    const data = await first; assert.equal(data.hits[0].private, undefined);
+    host.send({ type: 'watch', videoId: data.hits[0].id });
+    const playing = await host.next(m => m.type === 'state' && m.phase === 'watch' && !m.preparing);
+    assert.equal(playing.video.id, 'M7lc1UVf-VE');
+    controller.abort(); assert.equal((await settled).name, 'AbortError');
+    for (let i = 0; i < 20 && !searchSignal.aborted; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(searchSignal.aborted, true);
+  } finally { controller.abort(); finish?.([]); await reading?.catch(() => {}); await f.close(); }
+});
+
+test('repeated desired pause and resume requests keep one shared state; stale stop still ends playback', async () => {
+  const f = await fixture();
+  try {
+    const host = await f.join({ host: true }), guest = await f.join();
+    host.send({ type: 'watch', url: 'https://youtu.be/M7lc1UVf-VE' });
+    const playing = await host.next(m => m.type === 'state' && m.phase === 'watch' && !m.preparing);
+    const command = { type: 'pause', phase: 'watch', roundId: playing.roundId, paused: true };
+    host.send(command);
+    const paused = await host.next(m => m.type === 'state' && m.paused);
+    guest.send(command);
+    const repeated = await guest.next(m => m.type === 'state' && m.revision > paused.revision);
+    assert.equal(repeated.paused, true); assert.equal(repeated.video.pausedAt, paused.video.pausedAt);
+    guest.send({ ...command, paused: false });
+    const resumed = await guest.next(m => m.type === 'state' && m.phase === 'watch' && !m.paused && m.revision > repeated.revision);
+    host.send({ ...command, paused: false });
+    const repeatResume = await host.next(m => m.type === 'state' && m.revision > resumed.revision);
+    assert.equal(repeatResume.paused, false); assert.equal(repeatResume.video.startedAt, resumed.video.startedAt);
+    host.send({ type: 'stop', phase: 'watch', roundId: 'previous-round' });
+    await guest.next(m => m.type === 'state' && m.phase === 'waiting' && m.revision > repeatResume.revision);
+  } finally { await f.close(); }
+});
+
 test('streamed candidates are private, playable before completion and cancel when the browser leaves', async () => {
   const track = { id: 'early', title: '첫 곡', filename: 'private\\song.flac', username: 'private-user', size: 8192 };
   let searchSignal, gotProgress; const first = new Promise(resolve => { gotProgress = resolve; });
@@ -425,8 +473,7 @@ test('watch mode lets every participant control playback and rejects stale reque
     assert.equal(late.initialState.video.startSeconds, 90); assert.equal(late.initialState.paused, true); assert.equal(late.identity.host, false);
     a.send({ type: 'pause', ...control }); await a.next(m => m.type === 'state' && m.phase === 'watch' && !m.paused && m.video.startSeconds === 90);
     a.send({ type: 'watchSeek', seconds: -1, ...control }); assert.match((await a.next('error')).message, /올바른/);
-    a.send({ type: 'stop', roundId: 'old-video', phase: 'watch' }); assert.match((await a.next('error')).message, /영상이 바뀌/);
-    a.send({ type: 'stop', ...control }); await a.next(m => m.type === 'state' && m.phase === 'waiting' && !m.preparing && m.revision > seek.revision);
+    a.send({ type: 'stop', roundId: 'old-video', phase: 'watch' }); await a.next(m => m.type === 'state' && m.phase === 'waiting' && !m.preparing && m.revision > seek.revision);
     assert.equal(f.web.rooms.get(f.links.id).watch, false);
   } finally { await f.close(); }
 });

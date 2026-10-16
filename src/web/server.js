@@ -460,14 +460,25 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           return reply(200, data);
         }
         if (roomRoute[2] === '/videos') {
-          const results = await videoSearch(q);
-          const hits = results.filter(v => /^[\w-]{11}$/.test(v.id)).slice(0, 8).map(v => ({ id: v.id,
+          const controller = new AbortController(); res.once('close', () => controller.abort());
+          const streaming = String(req.headers.accept || '').includes('application/x-ndjson');
+          const publish = (results, type = 'progress') => {
+            if (controller.signal.aborted) return;
+            const hits = results.filter(v => /^[\w-]{11}$/.test(v.id)).slice(0, 8).map(v => ({ id: v.id,
             title: String(v.title || '유튜브 영상').slice(0, 200), channel: String(v.channel || '').slice(0, 100),
             duration: Number.isFinite(v.duration) && v.duration > 0 ? v.duration : null,
             artist: typeof v.artist === 'string' ? v.artist.slice(0, 100) : undefined, track: typeof v.track === 'string' ? v.track.slice(0, 200) : undefined,
             startSeconds: Math.min(86400, Math.max(0, Number(v.startSeconds) || 0)), thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` }));
-          for (const video of hits) { if (room.videoPicks.size >= 100) room.videoPicks.delete(room.videoPicks.keys().next().value); room.videoPicks.set(video.id, video); }
-          return reply(200, { hits });
+            for (const video of hits) { if (room.videoPicks.size >= 100 && !room.videoPicks.has(video.id)) room.videoPicks.delete(room.videoPicks.keys().next().value); room.videoPicks.set(video.id, video); }
+            if (!streaming) return { hits };
+            if (res.writableLength > 1024 * 1024) { controller.abort(); res.destroy(); return; }
+            res.write(JSON.stringify({ type, hits }) + '\n');
+          };
+          if (streaming) { headers(200, 'application/x-ndjson; charset=utf-8'); res.flushHeaders(); publish([]); }
+          const results = await videoSearch(q, { signal: controller.signal, onProgress: streaming ? publish : undefined });
+          const data = publish(results, 'done');
+          if (streaming) return res.end();
+          return reply(200, data);
         }
         const result = await search({ host: env.MACHUGI_TYPESENSE_HOST, apiKey: env.MACHUGI_TYPESENSE_API_KEY,
           query: q, perPage: 50, page: 1, sortBy: 'hits:desc' });
@@ -483,7 +494,8 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
       const kind = /\/tracks(?:\?|$)/.test(req.url) ? 'flac-search'
         : /\/videos(?:\?|$)/.test(req.url) ? 'youtube-search'
         : /\/quizzes(?:\?|$)/.test(req.url) ? 'quiz-search' : 'request';
-      console.warn(`[web] ${kind} failed:`, error.name === 'TimeoutError' ? 'upstream timeout' : error.code || 'upstream error');
+      console.warn(`[web] ${kind} failed:`, error.name === 'TimeoutError' ? 'upstream timeout' : error.code || error.kind || 'upstream error',
+        ...(error.stage && /^[a-z-]{1,24}$/.test(error.stage) ? [`stage=${error.stage}`] : []));
       const trackRequest = /\/tracks(?:\?|$)/.test(req.url);
       if (res.headersSent) return res.end(JSON.stringify({ type: 'error', error: error.message }) + '\n');
       reply(502, { error: trackRequest || error.code === 'YOUTUBE_AUTH_REQUIRED' ? error.message : '검색 서비스에 연결하지 못했습니다. 잠시 후 다시 시도하거나 유튜브 주소를 입력해주세요.' });
@@ -626,13 +638,14 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           }
           return;
         }
-        if (message.type === 'stop' && (room.starting || room.advancing)) {
+        if (message.type === 'stop') {
           room.cancelStart = true;
           if (!room.session) {
             room.startJob = null; room.starting = false;
             if (room.audioTrack) endAudio(room); else endWatch(room);
             return;
           }
+          room.session.requestStop(); return;
         }
         if (room.audioTrack) {
           if (message.roundId !== room.state.roundId || message.phase !== 'listen') throw new Error('곡이 바뀌었습니다. 다시 눌러주세요.');
@@ -646,7 +659,8 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           if (!audio.startedAt) throw new Error('아직 음원을 받고 있습니다. 잠시 기다려주세요.');
           if (message.type === 'pause') {
             if (room.state.buffering) throw new Error('끊김을 줄이기 위해 음원을 더 받고 있습니다. 준비되면 자동 재개됩니다.');
-            const paused = !room.state.paused;
+            const paused = typeof message.paused === 'boolean' ? message.paused : !room.state.paused;
+            if (paused === Boolean(room.state.paused)) { state(room, room.state); return; }
             if (paused) audio.pausedAt = time;
             else { audio.startedAt += time - audio.pausedAt; delete audio.pausedAt; }
             state(room, { ...room.state, paused, audio }); audioTimer(room);
@@ -664,7 +678,8 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           if (message.type === 'watchEnded') { finishPlayback(room); return; }
           const video = { ...room.state.video }, time = Date.now();
           if (message.type === 'pause') {
-            const paused = !room.state.paused;
+            const paused = typeof message.paused === 'boolean' ? message.paused : !room.state.paused;
+            if (paused === Boolean(room.state.paused)) { state(room, room.state); return; }
             if (paused) video.pausedAt = time;
             else { video.startedAt += time - video.pausedAt; delete video.pausedAt; }
             state(room, { ...room.state, paused, video });
@@ -679,6 +694,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         if (!room.session) throw new Error('진행 중인 게임이 없습니다.');
         if (message.type !== 'stop' && (message.roundId !== room.state.roundId || message.phase !== room.state.phase)) throw new Error('문제 화면이 바뀌었습니다. 다시 눌러주세요.');
         if (message.type === 'pause') {
+          if (typeof message.paused === 'boolean' && message.paused === Boolean(room.state.paused)) { state(room, room.state); return; }
           const result = room.state.paused ? room.session.resume() : room.session.pause();
           if (!result?.ok) throw new Error('지금은 재생을 정지할 수 없습니다. 노래가 준비된 뒤 다시 눌러주세요.');
         }
