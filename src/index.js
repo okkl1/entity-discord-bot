@@ -12,10 +12,11 @@ import { startPublicTunnel } from './web/tunnel.js';
 import { registerWatchTogether } from './web/watch-together.js';
 import { syncSlashCommands, syncGuildCommands } from './discord-commands.js';
 import { createEntryPanels, createWebEntryPublisher } from './web/entry-panel.js';
-import { resources } from './resource-profile.js';
+import { resources, RELEASE } from './resource-profile.js';
 import { startMemoryMonitor } from './runtime-memory.js';
 
 let web = null, tunnel = null, watchTogether;
+console.log(`[entity] release=${RELEASE} memoryProfile=${resources.compact ? 'compact' : 'standard'}`);
 const stopMemoryMonitor = resources.compact ? startMemoryMonitor() : () => {};
 const isOtherPlaybackActive = id => isRadioActive(id) || Boolean(watchTogether?.isActive(id));
 

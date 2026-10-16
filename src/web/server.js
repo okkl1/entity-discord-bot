@@ -11,6 +11,7 @@ import { createPeerFallback } from './peer-fallback.js';
 import { searchMatchedTracks, songFromVideo, matchTracks } from './track-match.js';
 import { searchMusicTracks } from './music-search.js';
 import { createMusicIdentityLookup, readVideoMusicMetadata } from './music-identity.js';
+import { resources, RELEASE } from '../resource-profile.js';
 
 const secret = () => randomBytes(24).toString('base64url');
 const sameSecret = (a, b) => typeof a === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -380,7 +381,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         await readFile(new URL('../../bin/slskd/slskd-source.zip', import.meta.url)), 'application/zip');
       if (url.pathname === '/opensource/slskd-license.txt') return reply(200,
         await readFile(new URL('../../bin/slskd/LICENSE', import.meta.url)), 'text/plain; charset=utf-8');
-      if (url.pathname === '/api/health') return reply(200, { ok: true });
+      if (url.pathname === '/api/health') return reply(200, { ok: true, release: RELEASE, memoryProfile: resources.compact ? 'compact' : 'standard' });
       const roomRoute = /^\/api\/rooms\/([\w-]+)(\/(?:quizzes|videos|tracks))?$/.exec(url.pathname);
       if (roomRoute) {
         const room = rooms.get(roomRoute[1]);

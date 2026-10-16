@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+export const RELEASE = '2026-10-16-v3.1';
 
 export function resourceSettings(env = process.env) {
   const compact = env.ENTITY_MEMORY_PROFILE === 'compact';
