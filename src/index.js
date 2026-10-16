@@ -12,8 +12,11 @@ import { startPublicTunnel } from './web/tunnel.js';
 import { registerWatchTogether } from './web/watch-together.js';
 import { syncSlashCommands, syncGuildCommands } from './discord-commands.js';
 import { createEntryPanels, createWebEntryPublisher } from './web/entry-panel.js';
+import { resources } from './resource-profile.js';
+import { startMemoryMonitor } from './runtime-memory.js';
 
 let web = null, tunnel = null, watchTogether;
+const stopMemoryMonitor = resources.compact ? startMemoryMonitor() : () => {};
 const isOtherPlaybackActive = id => isRadioActive(id) || Boolean(watchTogether?.isActive(id));
 
 function requireEnv(key) {
@@ -120,6 +123,7 @@ let closing = false;
 async function shutdown() {
   if (closing) return;
   closing = true;
+  stopMemoryMonitor();
   for (const guildId of client.guilds.cache.keys()) await stopSession(guildId);
   stopAllRadio();
   await watchTogether.close();
@@ -136,6 +140,7 @@ process.once('SIGTERM', shutdown);
 client.login(env.DISCORD_TOKEN).catch(error => {
   console.error('디스코드 로그인 실패:', error);
   process.exitCode = 1;
+  stopMemoryMonitor();
   binance.close().catch(() => {});
   tunnel?.close();
   web?.close().catch(() => {});

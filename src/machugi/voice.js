@@ -29,6 +29,7 @@ import { ytDlpOptions, youtubeFailure } from "./yt-dlp-options.js"
 import { clipLoopFilter } from "./audio-loop.js"
 import { monitorPlayback } from "./playback-monitor.js"
 import { ClipCache } from "./clip-cache.js"
+import { resources, onMemoryPressure } from "../resource-profile.js"
 import { encodeClip, OpusPacketStream, MAX_PREPARED_SECONDS } from "./prepared-audio.js"
 import {
   createAudioPlayer,
@@ -73,7 +74,9 @@ const preparedClips = new ClipCache(async ({ videoId, startSeconds, duration }, 
     if (!signal.aborted) audioUrls.invalidate(videoUrl, audioUrl)
     throw err
   }
-})
+}, { concurrency: resources.clipConcurrency, maxBytes: resources.clipCacheBytes })
+
+onMemoryPressure(() => preparedClips.clear())
 
 function preparedClip(videoId, startSeconds, duration, options) {
   return preparedClips.get(JSON.stringify([videoId, startSeconds, duration]), { videoId, startSeconds, duration }, options)

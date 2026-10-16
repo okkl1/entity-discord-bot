@@ -1,4 +1,6 @@
 import { songFromVideo, shorterMusicQuery, matchTracks } from './track-match.js';
+import { topResults } from './top-results.js';
+const compareRelated = (a, b) => (b.relatedScore ?? 90) - (a.relatedScore ?? 90) || Number(b.freeSlot) - Number(a.freeSlot) || (a.queueLength || 0) - (b.queueLength || 0) || (b.uploadSpeed || 0) - (a.uploadSpeed || 0);
 
 const words = text => String(text ?? '').normalize('NFKC').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ');
 const key = text => words(text).toLowerCase();
@@ -83,11 +85,11 @@ function relatedTrack(track, descriptor, original) {
   const sameArtist = descriptor.song.artistAliases.some(artist => coverage(artist, filename) === 1);
   if (titleScore === 1 && sameArtist) {
     const compared = matchTracks({ artist: original.artist || descriptor.song.artist, track: original.title, duration: original.duration }, [track]).hits[0];
-    if (compared?.confident) return { ...track, relatedScore: 100, relatedLabel: '곡명·가수 일치', relatedArtist: descriptor.song.artistAliases[0] };
-    if (compared?.matchLabel === '다른 버전일 수 있어요') return { ...track, relatedScore: 55,
+    if (compared?.confident) return { relatedScore: 100, relatedLabel: '곡명·가수 일치', relatedArtist: descriptor.song.artistAliases[0] };
+    if (compared?.matchLabel === '다른 버전일 수 있어요') return { relatedScore: 55,
       relatedLabel: compared.matchLabel, relatedArtist: descriptor.song.artistAliases[0] };
   }
-  return { ...track, relatedScore: Math.round(50 * titleScore + (sameArtist ? 35 : 0)),
+  return { relatedScore: Math.round(50 * titleScore + (sameArtist ? 35 : 0)),
     relatedArtist: sameArtist ? descriptor.song.artistAliases[0] : undefined,
     relatedLabel: sameArtist ? titleScore === 1 ? '같은 가수 · 곡명 유사' : '같은 가수의 연관 곡'
       : titleScore === 1 ? '곡명 일치 · 가수 확인' : titleScore > 0 ? '검색어 일부 일치' : '관련성 확인 필요' };
@@ -142,7 +144,7 @@ export async function searchMusicTracks(input, search, { signal, onProgress, dis
       const previous = unique.get(track.id);
       if (!previous || (track.relatedScore ?? 90) > (previous.relatedScore ?? 90)) unique.set(track.id, track);
     }
-    return [...unique.values()].sort((a, b) => (b.relatedScore ?? 90) - (a.relatedScore ?? 90) || Number(b.freeSlot) - Number(a.freeSlot) || (a.queueLength || 0) - (b.queueLength || 0) || (b.uploadSpeed || 0) - (a.uploadSpeed || 0)).slice(0, 100);
+    return topResults(unique.values(), compareRelated);
   };
   const result = () => ({ query: queries[0], stage, identity, searchedQueries: [...searchedQueries], hits: combine() });
   const completedQueries = new Set(skipQueries);
@@ -151,17 +153,28 @@ export async function searchMusicTracks(input, search, { signal, onProgress, dis
     const jobs = descriptors.map(descriptor => {
       searchedQueries.push(descriptor.query);
       const controller = new AbortController(), combined = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal;
-      const hasRelevantHits = hits => hits.some(track => relevantTitle(track, descriptor, original));
+      const relevance = new WeakMap(), scores = new WeakMap();
+      const relevant = track => {
+        if (!relevance.has(track)) relevance.set(track, relevantTitle(track, descriptor, original));
+        return relevance.get(track);
+      };
+      const hasRelevantHits = hits => hits.some(relevant);
       const accept = hits => {
         if (combined.aborted) return;
         if (stage === 'direct' && hasRelevantHits(hits)) discovery?.close();
-        partial.set(descriptor.query, hits.map(track => relatedTrack(track, descriptor, original)));
+        function* ranked() {
+          for (const track of hits) {
+            if (!scores.has(track)) scores.set(track, relatedTrack(track, descriptor, original));
+            yield { ...track, ...scores.get(track) };
+          }
+        }
+        partial.set(descriptor.query, topResults(ranked(), compareRelated));
         onProgress?.(result());
       };
       return { controller, hasRelevantHits, promise: Promise.resolve().then(async () => {
         const hits = await search(descriptor.query, { signal: combined, onProgress: accept, hasRelevantHits,
           searchTimeoutMs: stage === 'related' ? 3000 : 4000,
-          acceptHits: hits => hits.length >= 3 && hits.some(track => track.freeSlot && relevantTitle(track, descriptor, original)) });
+          acceptHits: hits => hits.length >= 3 && hits.some(track => track.freeSlot && relevant(track)) });
         combined.throwIfAborted(); successes++; completedQueries.add(descriptor.query); accept(hits); return hits;
       }) };
     });

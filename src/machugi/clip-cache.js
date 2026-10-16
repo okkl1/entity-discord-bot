@@ -55,6 +55,8 @@ export class ClipCache {
     }
   }
 
+  clear() { this.entries.clear(); this.bytes = 0 }
+
   store(job, value, error) {
     const bytes = value?.bytes ?? 0
     if (bytes > this.maxBytes) return

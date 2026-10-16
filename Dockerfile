@@ -29,6 +29,7 @@ RUN test -x /opt/slskd/slskd \
     && mkdir -p data/binance data/machugi data/lossless data/chzzk /tmp/dotnet-bundle \
     && chown -R node:node /app /tmp/dotnet-bundle
 ENV NODE_ENV=production \
+    ENTITY_MEMORY_PROFILE=compact \
     YT_DLP_PATH=/opt/yt-dlp/bin/yt-dlp \
     SLSKD_EXECUTABLE=/opt/slskd/slskd \
     DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet-bundle \
@@ -38,4 +39,4 @@ ENV NODE_ENV=production \
     WEB_ENABLED=1 WEB_PORT=3000 WEB_HOST=0.0.0.0 WEB_TUNNEL=0
 USER node
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["node", "src/index.js"]

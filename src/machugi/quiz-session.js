@@ -29,6 +29,7 @@ import { pingQuizPage } from "./machugi.js"
 import { PanelUpdateQueue } from "./panel-update-queue.js"
 import { EventEmitter } from "node:events"
 import { randomUUID } from "node:crypto"
+import { resources } from "../resource-profile.js"
 import { deleteGameMessages, deleteGameMessageLater } from "./game-messages.js"
 
 const sessions = new Map()
@@ -203,12 +204,12 @@ export class QuizSession {
 
   warmQuestions(index) {
     for (const [position, controller] of this.prefetchJobs) {
-      if (position < index || position > index + 2) {
+      if (position < index || position > index + resources.quizLookahead) {
         controller.abort()
         this.prefetchJobs.delete(position)
       }
     }
-    for (let position = index; position <= index + 2 && position < this.questions.length; position++) {
+    for (let position = index; position <= index + resources.quizLookahead && position < this.questions.length; position++) {
       if (this.prefetchJobs.has(position)) continue
       const controller = new AbortController()
       this.prefetchJobs.set(position, controller)

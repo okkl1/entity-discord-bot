@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SoulseekClient } from './soulseek-client.js';
+import { resources } from '../resource-profile.js';
 
 export const losslessRoot = fileURLToPath(new URL('../../data/lossless/', import.meta.url));
 const execute = promisify(execFile);
@@ -77,7 +78,8 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
         const config = { headless: true, no_version_check: true, no_share_scan: true, no_connect: noConnect,
           web: { port, ip_address: '127.0.0.1', https: { disabled: true }, authentication: {
             username: 'entity', password: randomBytes(24).toString('hex'), api_keys: { entity: { key: apiKey, role: 'readwrite', cidr: '127.0.0.1/32' } } } },
-          soulseek: { username: value.username, password: value.password, listen_port: 2235 },
+          soulseek: { username: value.username, password: value.password, listen_port: 2235,
+            ...(resources.compact ? { distributed_network: { disable_children: true } } : {}) },
           directories: { incomplete: join(cacheRoot, 'incomplete'), downloads: join(cacheRoot, 'complete') },
           transfers: { download: { retry: { attempts: 2 }, destination: { exists: 'overwrite' } } },
           retention: { search: 5, files: { complete: 120, incomplete: 120 } },

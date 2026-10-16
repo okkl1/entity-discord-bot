@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSoulseekSearchEvents } from './soulseek-search-events.js';
+import { resources, onMemoryPressure } from '../resource-profile.js';
+const compareTracks = (a, b) => Number(b.freeSlot) - Number(a.freeSlot) || a.queueLength - b.queueLength || b.uploadSpeed - a.uploadSpeed;
 
 function requestError(status, body, path) {
   let details = '';
@@ -51,13 +53,14 @@ export function normalizeTracks(responses) {
   // Keep the native candidate pool intact. The caller ranks the requested song
   // before imposing its display limit; an artist's fast peers may share many
   // unrelated tracks before the right file arrives from a queued peer.
-  return hits.sort((a, b) => Number(b.freeSlot) - Number(a.freeSlot) || a.queueLength - b.queueLength || b.uploadSpeed - a.uploadSpeed).slice(0, 25_000);
+  return hits.sort(compareTracks).slice(0, 25_000);
 }
 
 export class SoulseekClient {
   constructor({ baseUrl, apiKey, fetchImpl = fetch, searchMs = 7000, extendedSearchMs = searchMs * 2, pollMs = 250,
     minSearchMs = 1500, settleMs = 500, minHits = 10, matchMs = 500,
-    now = Date.now, sleep = delay, searchEvents, loginFailure = async () => null, loginWaitMs = 20_000 }) {
+    now = Date.now, sleep = delay, searchEvents, loginFailure = async () => null, loginWaitMs = 20_000,
+    cacheMaxTracks = resources.searchCacheTracks, cacheMaxEntries = resources.searchCacheEntries }) {
     this.baseUrl = baseUrl.replace(/\/$/, ''); this.apiKey = apiKey; this.fetch = fetchImpl; this.searchMs = searchMs;
     this.extendedSearchMs = Math.max(searchMs, extendedSearchMs);
     this.pollMs = pollMs; this.minSearchMs = minSearchMs; this.settleMs = settleMs; this.minHits = minHits; this.matchMs = matchMs;
@@ -66,6 +69,16 @@ export class SoulseekClient {
     this.posts = Promise.resolve(); this.cleanups = new Set();
     this.loginFailure = loginFailure;
     this.loginWaitMs = loginWaitMs;
+    this.cacheMaxTracks = cacheMaxTracks; this.cacheMaxEntries = cacheMaxEntries;
+    this.pruneTimer = setInterval(() => this.pruneCache(), 30_000); this.pruneTimer.unref();
+    this.offPressure = onMemoryPressure(() => this.pruneCache(Math.min(this.cacheMaxTracks, 2000)));
+  }
+  pruneCache(maxTracks = this.cacheMaxTracks) {
+    for (const [key, value] of this.cache) if (value.until <= this.now()) this.cache.delete(key);
+    let count = [...this.cache.values()].reduce((sum, value) => sum + value.hits.length, 0);
+    while (this.cache.size && (count > maxTracks || this.cache.size > this.cacheMaxEntries)) {
+      const key = this.cache.keys().next().value; count -= this.cache.get(key).hits.length; this.cache.delete(key);
+    }
   }
   get searching() { return this.pending.values().next().value ?? null; }
   async request(path, { method = 'GET', body, signal, timeoutMs = 45_000 } = {}) {
@@ -124,9 +137,11 @@ export class SoulseekClient {
     signal?.throwIfAborted(); this.controller.signal.throwIfAborted();
     query = String(query ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().slice(0, 120);
     if (query.length < 2) throw new Error('가수나 곡 제목을 두 글자 이상 입력해주세요.');
+    this.pruneCache();
     const key = query.toLowerCase(), cached = this.cache.get(key);
     if (cached?.until > this.now() && (!acceptHits || acceptHits(cached.hits) ||
       cached.complete && (cached.extended || !hasRelevantHits || hasRelevantHits(cached.hits)))) {
+      this.cache.delete(key); this.cache.set(key, cached);
       onProgress?.(cached.hits); return cached.hits;
     }
     let job = this.pending.get(key);
@@ -165,7 +180,7 @@ export class SoulseekClient {
   }
   async runSearch(job) {
     const { id } = job, signal = AbortSignal.any([job.controller.signal, this.controller.signal]);
-    let created = false, unsubscribe, complete = false, extended = false, hits = [], changedAt = 0;
+    let created = false, unsubscribe, complete = false, extended = false, hits = [], changedAt = 0, statusReadError;
     const responses = new Map(); let responseRevision = 0, normalizedRevision = -1;
     try {
       signal.throwIfAborted();
@@ -173,7 +188,9 @@ export class SoulseekClient {
       await this.waitForLogin(signal);
       unsubscribe = await this.searchEvents?.subscribe(id, peer => {
         if (!peer?.username || !Array.isArray(peer.files) || responses.size >= 250 && !responses.has(peer.username)) return;
-        responses.set(peer.username, peer); changedAt = this.now(); responseRevision++;
+        // Retain only normalized FLAC fields, not the peer's entire multi-format listing.
+        // Unchanged peers keep the same track objects across progress updates.
+        responses.set(peer.username, normalizeTracks([peer])); changedAt = this.now(); responseRevision++;
       });
       signal.throwIfAborted();
       const post = this.posts.catch(() => {}).then(async () => {
@@ -189,7 +206,7 @@ export class SoulseekClient {
         const expired = [...job.waiters].filter(waiter => elapsed >= waiter.timeoutMs);
         // Without live responses, finalize and read the native saved list even
         // for a short search. A disconnected hub must not turn hits into zero.
-        if (expired.length === job.waiters.size && !responses.size) break;
+        if (expired.length === job.waiters.size && (!responses.size || (!hits.length && statusReadError))) break;
         for (const waiter of expired) this.finishWaiter(job, waiter, hits);
         if (!job.waiters.size) break;
         const missing = [...job.waiters].some(waiter => waiter.hasRelevantHits ? !waiter.hasRelevantHits(hits)
@@ -202,13 +219,19 @@ export class SoulseekClient {
         // Show the first peer immediately while the same search continues to
         // collect more choices. No minimum candidate count applies to display.
         if (responses.size && responseRevision !== normalizedRevision) {
-          normalizedRevision = responseRevision; hits = normalizeTracks([...responses.values()]);
+          normalizedRevision = responseRevision; hits = [...responses.values()].flat().sort(compareTracks).slice(0, 25_000);
           job.hits = hits; job.revision = responseRevision;
           if (hits.length) for (const waiter of [...job.waiters]) this.progress(job, waiter);
         }
         if (!job.waiters.size) break;
         if (this.now() - checkedAt >= 1000) {
-          const status = await this.request(`/searches/${id}`, { signal, timeoutMs: 2000 }); checkedAt = this.now();
+          let status;
+          try { status = await this.request(`/searches/${id}`, { signal, timeoutMs: 2000 }); statusReadError = null; }
+          catch (error) {
+            if (!['local_timeout', 'local_connection'].includes(error.kind)) throw error;
+            statusReadError = error;
+          }
+          checkedAt = this.now();
           if (searchErrored(status)) throw new Error('Soulseek 검색이 내부 오류로 중단되었습니다. 이미 도착한 후보는 선택할 수 있으며, 새 검색도 다시 시도할 수 있습니다.');
           if (status?.endedAt) { complete = true; break; }
         }
@@ -226,22 +249,26 @@ export class SoulseekClient {
         // also caps a search that keeps extending its inactivity timeout.
         if (!complete) complete = await this.stopSearch(id, signal);
         const saved = await this.request(`/searches/${id}/responses`, { signal, timeoutMs: 3000 });
-        hits = normalizeTracks([...responses.values(), ...(Array.isArray(saved) ? saved : [])]);
+        const unique = new Map();
+        for (const track of [...responses.values()].flat().concat(normalizeTracks(Array.isArray(saved) ? saved : []))) if (!unique.has(track.id)) unique.set(track.id, track);
+        hits = [...unique.values()].sort(compareTracks).slice(0, 25_000);
+        if (!hits.length && statusReadError) throw statusReadError;
         for (const waiter of [...job.waiters]) this.finishWaiter(job, waiter, hits);
       }
       if (this.pending.get(job.key) === job) {
         // Broad artist queries can contain thousands of candidates. Bound the
         // shared cache by candidate count as well as number of query keys.
-        let cachedTracks = [...this.cache.values()].reduce((sum, entry) => sum + entry.hits.length, 0);
-        while (this.cache.size && (this.cache.size >= 60 || cachedTracks + hits.length > 50_000)) {
-          const oldest = this.cache.keys().next().value; cachedTracks -= this.cache.get(oldest).hits.length; this.cache.delete(oldest);
-        }
-        this.cache.set(job.key, { hits, complete, extended, until: this.now() + (hits.length ? 120_000 : 5000) });
+        this.cache.delete(job.key);
+        // Large searches still return every candidate. Avoid caching a truncated
+        // list that could later hide the requested recording from a warm lookup.
+        if (hits.length <= this.cacheMaxTracks) this.cache.set(job.key, { hits, complete, extended, until: this.now() + (hits.length ? 120_000 : 5000) });
+        this.pruneCache();
       }
     } catch (error) {
       for (const waiter of [...job.waiters]) this.finishWaiter(job, waiter, null, error);
     } finally {
       unsubscribe?.();
+      responses.clear(); job.hits = null;
       if (this.pending.get(job.key) === job) this.pending.delete(job.key);
       if (created) {
         // Local cleanup must not add up to five seconds to a usable result.
@@ -285,5 +312,5 @@ export class SoulseekClient {
     const transfer = await this.transfer(id, { timeoutMs: 5000 }).catch(error => { if (error.status === 404) return null; throw error; });
     if (transfer) await this.request(`/transfers/downloads/${encodeURIComponent(transfer.username)}/${transfer.id}?remove=true`, { method: 'DELETE', timeoutMs: 5000 });
   }
-  close() { this.controller.abort(); this.searchEvents?.close(); this.cache.clear(); }
+  close() { clearInterval(this.pruneTimer); this.offPressure(); this.controller.abort(); this.searchEvents?.close(); this.cache.clear(); }
 }

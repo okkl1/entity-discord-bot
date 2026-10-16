@@ -6,6 +6,46 @@ import { matchTracks } from '../src/web/track-match.js';
 const peer = (count = 10, extra = {}) => ({ username: 'test-peer', hasFreeUploadSlot: true, queueLength: 0,
   files: Array.from({ length: count }, (_, index) => ({ filename: `Artist\\Song ${index}.flac`, size: 1024 })), ...extra });
 
+test('normalization reuses unchanged peer tracks across progress without narrowing native search limits', async () => {
+  const f = fixture({ updates: [{ at: 250, peer: peer(1) }, { at: 500, peer: peer(1, { username: 'second' }) }] });
+  const snapshots = [];
+  try {
+    const hits = await f.client.search('song', { onProgress: value => snapshots.push(value) });
+    assert.equal(hits.length, 2);
+    assert.equal(snapshots[0][0], snapshots[1][0]);
+    assert.equal(f.calls.find(call => call.method === 'POST').body.fileLimit, 25_000);
+    assert.equal(f.calls.find(call => call.method === 'POST').body.responseLimit, 250);
+  } finally { await f.close(); }
+});
+
+test('a large search is fully returned instead of being truncated to a compact cache budget', async () => {
+  const f = fixture({ updates: [{ at: 250, peer: peer(1200) }], options: { cacheMaxTracks: 1000 } });
+  try {
+    const hits = await f.client.search('Artist'); assert.equal(hits.length, 1200);
+    assert.ok(hits.some(track => track.title === 'Song 1199')); assert.equal(f.client.cache.has('artist'), false);
+  } finally { await f.close(); }
+});
+
+test('compact cache retains warm recent searches while pruning old entries and expired results', async () => {
+  const f = fixture({ options: { cacheMaxTracks: 20, cacheMaxEntries: 2 } });
+  try {
+    await f.client.search('one'); await f.client.search('two');
+    const count = f.starts.size; await f.client.search('one'); assert.equal(f.starts.size, count);
+    await f.client.search('three'); assert.equal(f.client.cache.has('one'), true); assert.equal(f.client.cache.has('two'), false);
+    f.advance(120_001); f.client.pruneCache(); assert.equal(f.client.cache.size, 0);
+  } finally { await f.close(); }
+});
+
+test('a slow status endpoint does not discard live choices or usable saved results', async () => {
+  const f = fixture({ updates: [{ at: 250, peer: peer(1) }], saved: [peer(1, { username: 'saved' })] });
+  const fetch = f.client.fetch;
+  f.client.fetch = (url, options) => new URL(url).pathname.match(/\/searches\/[^/]+$/) && options.method === 'GET'
+    ? Promise.reject(new DOMException('private details', 'TimeoutError')) : fetch(url, options);
+  try {
+    const hits = await f.client.search('rare song'); assert.equal(hits.length, 2);
+  } finally { await f.close(); }
+});
+
 test('a short search keeps its REST fallback and one caller deadline does not cancel a shared longer lookup', async () => {
   const offline = fixture({ live: false, saved: [peer(1)] });
   try {
