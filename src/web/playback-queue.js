@@ -38,6 +38,17 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
       if (entries.some(item => item.kind === kind && item.pick.id === pick.id)) throw new Error('이미 예약한 곡입니다.');
       const id = randomUUID(); entries.push({ id, kind, pick, status: 'waiting', owner: `${ownerPrefix}:${id}` }); onChange(); prime(); return id;
     },
+    addMany(kind, picks) {
+      const known = new Set(entries.filter(item => item.kind === kind).map(item => item.pick.id)); let added = 0;
+      for (const pick of picks) {
+        if (known.has(pick.id)) continue;
+        known.add(pick.id); const id = randomUUID();
+        entries.push({ id, kind, pick, status: 'waiting', owner: `${ownerPrefix}:${id}` }); added++;
+      }
+      // One album is one change, rather than one full room broadcast per song.
+      if (added) { onChange(); prime(); }
+      return { added, skipped: picks.length - added };
+    },
     async take() { const item = entries.shift(); if (!item) return null; item.claimed = true; onChange(); await item.pending; return item; },
     async remove(id) { const item = entries.find(i => i.id === id); if (!item) throw new Error('예약 목록이 바뀌었습니다.'); entries = entries.filter(i => i !== item); onChange(); await release(item); prime(); },
     async clear() { const previous = entries; entries = []; if (previous.length) onChange(); await Promise.allSettled(previous.map(release)); },

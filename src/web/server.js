@@ -10,6 +10,7 @@ import { createPlaybackQueue } from './playback-queue.js';
 import { createPeerFallback } from './peer-fallback.js';
 import { searchMatchedTracks, songFromVideo, matchTracks } from './track-match.js';
 import { searchMusicTracks } from './music-search.js';
+import { searchMusicAlbums, publicAlbum, publicTrack } from './album-search.js';
 import { createMusicIdentityLookup, readVideoMusicMetadata } from './music-identity.js';
 import { resources, RELEASE } from '../resource-profile.js';
 
@@ -48,15 +49,28 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     baseUrl = parsed.origin;
   }
   const staticFiles = new Map();
-  const send = (ws, data) => {
+  const send = (ws, data, replaceable = false) => {
     if (ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > 256 * 1024) { ws.close(1013, 'Connection too slow'); return; }
-    ws.send(typeof data === 'string' ? data : JSON.stringify(data));
+    const isState = replaceable || data?.type === 'state';
+    const payload = typeof data === 'string' ? data : JSON.stringify(data);
+    if (ws.bufferedAmount > 256 * 1024 + (ws.stateBytes || 0)) { ws.close(1013, 'Connection too slow'); return; }
+    const bytes = isState ? Buffer.byteLength(payload) : 0;
+    // Preserve ordinary small transition/retry notices exactly as before.
+    if (!isState || (!ws.stateInFlight && bytes < 64 * 1024)) { ws.send(payload); return; }
+    // A large album must not enqueue one full queue snapshot for each initial
+    // preparation event. Keep one in flight and only the newest pending state.
+    if (ws.stateInFlight) { ws.pendingState = payload; return; }
+    ws.stateInFlight = true; ws.stateBytes = bytes;
+    ws.send(payload, error => {
+      ws.stateInFlight = false; ws.stateBytes = 0;
+      const pending = ws.pendingState; ws.pendingState = null;
+      if (!error && pending && ws.readyState === WebSocket.OPEN) send(ws, pending, true);
+    });
   };
   const broadcast = (room, data) => {
     if (!room.clients.size) return;
     const payload = JSON.stringify(data);
-    for (const ws of room.clients.keys()) send(ws, payload);
+    for (const ws of room.clients.keys()) send(ws, payload, data.type === 'state');
   };
   const entryChannelUrl = room => `https://discord.com/channels/${room.guildId}/${room.entryChannelId || room.textChannel?.id || room.voiceChannel.id}`;
   const presence = room => broadcast(room, { type: 'presence', players: [...room.clients.values()].map(p => ({ name: p.name, host: p.host })) });
@@ -65,6 +79,13 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     room.state = value;
     room.revision++;
     broadcast(room, { type: 'state', ...value, preparing: Boolean(room.starting || room.advancing), revision: room.revision, serverTime: Date.now() });
+  };
+  const findTrack = (room, id) => {
+    const direct = room.trackPicks.get(id); if (direct) return direct;
+    for (const album of room.albumPicks.values()) {
+      const track = album.tracks.find(track => track.id === id); if (track) return track;
+    }
+    return null;
   };
   const cleanupReplies = room => {
     const cleanups = [...room.replyCleanups]; room.replyCleanups.clear();
@@ -393,7 +414,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
       if (url.pathname === '/opensource/slskd-license.txt') return reply(200,
         await readFile(new URL('../../bin/slskd/LICENSE', import.meta.url)), 'text/plain; charset=utf-8');
       if (url.pathname === '/api/health') return reply(200, { ok: true, release: RELEASE, memoryProfile: resources.compact ? 'compact' : 'standard' });
-      const roomRoute = /^\/api\/rooms\/([\w-]+)(\/(?:quizzes|videos|tracks))?$/.exec(url.pathname);
+      const roomRoute = /^\/api\/rooms\/([\w-]+)(\/(?:quizzes|videos|tracks|albums))?$/.exec(url.pathname);
       if (roomRoute) {
         const room = rooms.get(roomRoute[1]);
         if (!room) return reply(404, { error: '방을 찾을 수 없습니다. 디스코드에서 새 방을 만들어주세요.' });
@@ -405,6 +426,30 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         httpLimits.set(ip, limit);
         if (++limit.count > 60) return reply(429, { error: '검색이 많습니다. 잠시 후 다시 시도해주세요.' });
         const q = (url.searchParams.get('q') ?? '').slice(0, 120);
+        if (roomRoute[2] === '/albums') {
+          const albumId = url.searchParams.get('album');
+          if (albumId) {
+            const album = room.albumPicks.get(albumId);
+            if (!album) return reply(404, { error: '앨범 검색 결과가 만료됐습니다. 다시 검색해주세요.' });
+            return reply(200, { ...publicAlbum(album), stage: 'albums', hits: album.tracks.map(publicTrack) });
+          }
+          const controller = new AbortController(); res.once('close', () => controller.abort());
+          const streaming = String(req.headers.accept || '').includes('application/x-ndjson');
+          const publish = (result, type = 'progress') => {
+            if (controller.signal.aborted) return;
+            room.albumPicks = new Map(result.albums.map(album => [album.id, album]));
+            const data = { query: result.query, stage: 'albums', hits: [], albums: result.albums.map(publicAlbum) };
+            if (!streaming) return data;
+            if (res.writableLength > 1024 * 1024) { controller.abort(); res.destroy(); return; }
+            res.write(JSON.stringify({ type, ...data }) + '\n');
+          };
+          if (streaming) { headers(200, 'application/x-ndjson; charset=utf-8'); res.flushHeaders(); }
+          const result = await searchMusicAlbums(q, (query, options) => lossless.search(query, options), {
+            signal: controller.signal, onProgress: streaming ? publish : undefined });
+          const data = publish(result, 'done');
+          if (streaming) return res.end();
+          return reply(200, data);
+        }
         if (roomRoute[2] === '/tracks') {
           const controller = new AbortController(); res.once('close', () => controller.abort());
           const streaming = String(req.headers.accept || '').includes('application/x-ndjson');
@@ -503,12 +548,12 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
       reply(200, staticFiles.get(asset[0]), asset[1]);
     } catch (error) {
       if (res.destroyed) return;
-      const kind = /\/tracks(?:\?|$)/.test(req.url) ? 'flac-search'
+      const kind = /\/albums(?:\?|$)/.test(req.url) ? 'album-search' : /\/tracks(?:\?|$)/.test(req.url) ? 'flac-search'
         : /\/videos(?:\?|$)/.test(req.url) ? 'youtube-search'
         : /\/quizzes(?:\?|$)/.test(req.url) ? 'quiz-search' : 'request';
       console.warn(`[web] ${kind} failed:`, error.name === 'TimeoutError' ? 'upstream timeout' : error.code || error.kind || 'upstream error',
         ...(error.stage && /^[a-z-]{1,24}$/.test(error.stage) ? [`stage=${error.stage}`] : []));
-      const trackRequest = /\/tracks(?:\?|$)/.test(req.url);
+      const trackRequest = /\/(?:tracks|albums)(?:\?|$)/.test(req.url);
       if (res.headersSent) return res.end(JSON.stringify({ type: 'error', error: error.message }) + '\n');
       reply(502, { error: trackRequest || error.code === 'YOUTUBE_AUTH_REQUIRED' ? error.message : '검색 서비스에 연결하지 못했습니다. 잠시 후 다시 시도하거나 유튜브 주소를 입력해주세요.' });
     }
@@ -585,10 +630,19 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         }
         if (message.type === 'cancelFlac') { cancelHandoff(room); return; }
         if (message.sourceRoundId !== undefined && (room.state.phase !== 'watch' || message.sourceRoundId !== room.state.roundId || message.sourceVideoId !== room.state.video?.id)) throw new Error('재생 영상이 바뀌었습니다. 현재 영상에서 다시 눌러주세요.');
+        if (message.type === 'queueAlbum') {
+          if (room.session || room.startJob?.kind === 'quiz' || busy(room.guildId) || isRadioActive(room.guildId)) throw new Error('음악 감상이나 웹 유튜브 방에서 예약해주세요.');
+          const album = room.albumPicks.get(message.albumId);
+          if (!album) throw new Error('앨범 검색 결과가 만료됐습니다. 다시 검색해주세요.');
+          const counts = room.queue.addMany('listen', album.tracks.map(track => ({ ...track, waitForComplete: message.playbackMode === 'verified' })));
+          send(ws, { type: 'albumQueueAck', title: album.title, ...counts });
+          if (!room.audioTrack && !room.watch && !room.starting && !room.advancing && room.queue.size) finishPlayback(room);
+          return;
+        }
         if (message.type === 'queueAdd') {
           if (room.session || room.startJob?.kind === 'quiz' || busy(room.guildId) || isRadioActive(room.guildId)) throw new Error('음악 감상이나 웹 유튜브 방에서 예약해주세요.');
           const kind = message.kind;
-          const pick = kind === 'listen' ? room.trackPicks.get(message.trackId) : kind === 'watch' ? room.videoPicks.get(message.videoId) : null;
+          const pick = kind === 'listen' ? findTrack(room, message.trackId) : kind === 'watch' ? room.videoPicks.get(message.videoId) : null;
           if (!pick) throw new Error('검색 결과에서 예약할 곡을 선택해주세요.');
           room.queue.add(kind, { ...pick, waitForComplete: message.playbackMode === 'verified' }); send(ws, { type: 'queueAck', title: pick.title });
           if (!room.audioTrack && !room.watch && !room.starting && !room.advancing) finishPlayback(room);
@@ -602,7 +656,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           await advance(room); return;
         }
         if (message.type === 'listen') {
-          const pick = room.trackPicks.get(message.trackId); if (!pick) throw new Error('무손실 음악 검색 결과에서 곡을 선택해주세요.');
+          const pick = findTrack(room, message.trackId); if (!pick) throw new Error('무손실 음악 검색 결과에서 곡을 선택해주세요.');
           await playListen(room, { ...pick, waitForComplete: message.playbackMode === 'verified' }); return;
         }
         if (message.type === 'watch') {
@@ -721,7 +775,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         if (error.code === 'DISCORD_JOIN_REQUIRED') ws.close(1008, 'Discord entry required');
       }
     });
-    ws.on('close', () => { clearTimeout(joinTimer); room.clients.delete(ws); room.touchedAt = Date.now(); presence(room); });
+    ws.on('close', () => { clearTimeout(joinTimer); ws.pendingState = null; room.clients.delete(ws); room.touchedAt = Date.now(); presence(room); });
   });
 
   const heartbeat = setInterval(() => {
@@ -747,7 +801,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     if (!room) {
       if (rooms.size >= 32) throw new Error('방이 많습니다. 잠시 후 다시 시도해주세요.');
       room = { id: secret(), hostToken: secret(), title, guildId, ownerId, textChannel, voiceChannel,
-        players: new Map(), clients: new Map(), discordEntries: new Map(), videoPicks: new Map(), trackPicks: new Map(), replyCleanups: new Set(), revision: 0, touchedAt: Date.now(), starting: false, queueEpoch: 0,
+        players: new Map(), clients: new Map(), discordEntries: new Map(), videoPicks: new Map(), trackPicks: new Map(), albumPicks: new Map(), replyCleanups: new Set(), revision: 0, touchedAt: Date.now(), starting: false, queueEpoch: 0,
         state: { phase: 'waiting', title, index: 0, total: 0, roundId: null, answer: null, video: null, scores: [] } };
       const created = room;
       room.queue = createPlaybackQueue({ lossless, ownerPrefix: `queue:${room.id}`, onChange: () => state(created, created.state) });

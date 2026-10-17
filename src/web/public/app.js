@@ -31,6 +31,7 @@ function localPlaybackState(value) {
 }
 let losslessConfigured = false, losslessPrepared = false;
 const trackCards = new Map();
+const albumCards = new Map();
 let mode = new URLSearchParams(location.search).get('mode') === 'watch' ? 'watch' : 'quiz';
 let scoreKey = '', presenceKey = '', queueKey = '', searchedQuizzes = false;
 function selectMode(value) {
@@ -54,6 +55,17 @@ const storageSet = (key, value) => { try { localStorage.setItem(key, value); } c
 $('lossless-mode').value = storageGet('entity-lossless-mode') === 'verified' ? 'verified' : 'fast';
 $('lossless-mode').onchange = () => storageSet('entity-lossless-mode', $('lossless-mode').value);
 const playbackMode = () => $('lossless-mode').value;
+$('track-search-kind').value = storageGet('entity-lossless-search-kind') === 'albums' ? 'albums' : 'tracks';
+const albumSearch = () => $('track-search-kind').value === 'albums';
+function updateSearchKind() {
+  $('track-search').placeholder = albumSearch() ? '가수·앨범명 (예: Toby Fox - UNDERTALE)' : '가수·곡명 또는 유튜브 제목·주소';
+}
+$('track-search-kind').onchange = () => {
+  storageSet('entity-lossless-search-kind', $('track-search-kind').value); trackController?.abort();
+  clearTrackResults(albumSearch() ? '앨범명을 입력하면 같은 폴더의 FLAC을 묶어 보여드려요.' : '가수·곡명 또는 유튜브 주소를 입력하세요.');
+  $('track-search-status').textContent = ''; updateSearchKind();
+};
+updateSearchKind();
 const resumeKey = `entity-room:${roomId}`;
 const resumeGet = () => { try { return sessionStorage.getItem(resumeKey) ?? ''; } catch { return ''; } };
 const resumeSet = value => { try { sessionStorage.setItem(resumeKey, value); } catch {} };
@@ -253,6 +265,7 @@ function connect() {
       const rtt = Date.now() - msg.sentAt;
       if (rtt <= bestRtt + 20) { bestRtt = Math.min(bestRtt, rtt); offset = msg.serverTime - (msg.sentAt + Date.now()) / 2; }
     } else if (msg.type === 'queueAck') notify(`${msg.title} · 다음 곡으로 예약했어요.`);
+    else if (msg.type === 'albumQueueAck') notify(`${msg.title} · ${msg.added}곡 예약${msg.skipped ? ` · 중복 ${msg.skipped}곡 제외` : ''}`);
     else if (msg.type === 'error') { clearPendingPause(); notify(msg.message); if (state) applyState(state); }
   };
   ws.onclose = event => {
@@ -323,6 +336,7 @@ function renderVideos(hits) {
     }
 }
 async function searchTracks() {
+  if (albumSearch()) return searchAlbums();
   trackController?.abort(); trackController = new AbortController();
   const controller = trackController;
   let hasHits = false;
@@ -352,6 +366,77 @@ async function searchTracks() {
     }
   }
 }
+async function searchAlbums() {
+  trackController?.abort(); const controller = trackController = new AbortController(); let hasAlbums = false;
+  clearTrackResults('앨범 폴더를 찾고 있어요. 결과가 도착하면 바로 표시합니다.');
+  $('track-search-status').textContent = '앨범 검색 중…';
+  try {
+    const response = await fetch(`/api/rooms/${roomId}/albums?${new URLSearchParams({ q: $('track-search').value })}`, {
+      signal: controller.signal, headers: { Accept: 'application/x-ndjson' } });
+    const data = await readTrackSearchResponse(response, { signal: controller.signal, onProgress: data => {
+      if (trackController !== controller) return;
+      if (data.albums?.length) { hasAlbums = true; renderAlbums(data.albums); }
+      $('track-search-status').textContent = data.albums?.length ? `${data.albums.length}개 공유본 도착 · 추가 검색 중…` : '가수·앨범명으로 공유 폴더를 찾는 중…';
+    } });
+    if (trackController !== controller) return;
+    renderAlbums(data.albums || []);
+    $('track-search-status').textContent = data.albums?.length ? `${data.albums.length}개 앨범 공유본 · 곡 목록을 확인하거나 앨범을 예약하세요.` : '일치하는 앨범 폴더가 없어요. 앨범명이나 가수·앨범명으로 다시 검색해주세요.';
+  } catch (error) {
+    if (error.name !== 'AbortError' && trackController === controller) {
+      $('track-search-status').textContent = error.message;
+      if (!hasAlbums) clearTrackResults('앨범 검색을 완료하지 못했습니다. 다시 시도해주세요.');
+    }
+  }
+}
+function renderAlbums(albums) {
+  const ids = new Set(albums.map(album => album.id));
+  for (const [id, card] of albumCards) if (!ids.has(id) && !card.contains(document.activeElement)) { card.remove(); albumCards.delete(id); }
+  if (albums.length) $('track-results').querySelector(':scope > p')?.remove();
+  else if (!albumCards.size) clearTrackResults('검색된 앨범이 없어요. 가수·앨범명을 입력해주세요.');
+  for (const [index, album] of albums.entries()) {
+    let card = albumCards.get(album.id);
+    if (!card) {
+      card = textElement('div', '', 'quiz-option album-option');
+      const title = textElement('strong', album.title), detail = textElement('small', '', 'album-detail');
+      const note = textElement('small', '검색에 응답한 폴더의 곡 목록입니다. 전체 수록곡과 다를 수 있어요.');
+      const actions = textElement('div', '', 'result-actions'), list = document.createElement('div'); list.className = 'album-tracks'; list.hidden = true;
+      const show = textElement('button', '곡 목록', 'secondary'); show.type = 'button';
+      let loading = false;
+      show.onclick = async () => {
+        if (loading) return; loading = true; show.textContent = '목록 불러오는 중…';
+        try {
+          const response = await fetch(`/api/rooms/${roomId}/albums?${new URLSearchParams({ album: album.id })}`, { signal: trackController?.signal });
+          const data = await readApiResponse(response); list.replaceChildren();
+          for (const [i, track] of data.hits.entries()) {
+            const row = textElement('div', '', 'album-track');
+            row.append(textElement('span', `${i + 1}. ${track.title}`));
+            row.append(textElement('small', `${track.bitDepth || '?'}bit / ${track.sampleRate ? track.sampleRate / 1000 : '?'}kHz · ${(track.size / 1024 / 1024).toFixed(1)}MB`));
+            const buttons = textElement('div', '', 'result-actions');
+            for (const [label, type] of [['듣기', 'listen'], ['예약', 'queueAdd']]) {
+              const button = textElement('button', label, 'quiet'); button.type = 'button'; button.disabled = !joined || Boolean(state?.preparing);
+              button.onclick = () => { losslessPlayer.enable(); send({ type, kind: 'listen', trackId: track.id, playbackMode: playbackMode() }); };
+              buttons.append(button);
+            }
+            row.append(buttons); list.append(row);
+          }
+          list.hidden = false;
+        } catch (error) { if (error.name !== 'AbortError') notify(error.message); }
+        finally { loading = false; show.textContent = list.hidden ? '곡 목록' : '곡 목록 새로고침'; }
+      };
+      const reserve = textElement('button', '앨범 예약', 'secondary'); reserve.type = 'button';
+      reserve.onclick = () => { losslessPlayer.enable(); send({ type: 'queueAlbum', albumId: album.id, playbackMode: playbackMode() }); };
+      actions.append(show, reserve); card.append(title, detail, note, actions, list); albumCards.set(album.id, card); $('track-results').append(card);
+    }
+    card.querySelector('.album-detail').textContent = `공유본 ${index + 1} · 검색된 ${album.trackCount}곡${album.truncated ? ` / ${album.totalFound}곡 중 표시` : ''} · ${(album.size / 1024 / 1024).toFixed(1)}MB · ${album.freeSlot ? '전송 슬롯 있음' : '전송 대기'}`;
+    for (const button of card.querySelectorAll('button')) button.disabled = !joined || Boolean(state?.preparing);
+  }
+  let next = null;
+  for (const album of [...albums].reverse()) {
+    const card = albumCards.get(album.id);
+    if (card.nextSibling !== next && !card.contains(document.activeElement)) $('track-results').insertBefore(card, next);
+    next = card;
+  }
+}
 function showMusicIdentity(identity) {
   $('track-identity').hidden = !identity;
   $('track-identity').textContent = identity ? `검색할 곡: ${identity.artist} · ${identity.title}` : '';
@@ -359,6 +444,7 @@ function showMusicIdentity(identity) {
 function clearTrackResults(message) {
   showMusicIdentity();
   trackCards.clear();
+  albumCards.clear();
   $('track-results').replaceChildren();
   if (message) $('track-results').append(textElement('p', message, 'small'));
 }
@@ -398,6 +484,7 @@ function updateFlacButton() {
   $('current-flac').textContent = state?.pendingAudio ? state.pendingAudio.status === 'retrying' ? '다른 공유자 찾는 중 · 전환 취소' : `FLAC 전환 취소 · ${state.pendingAudio.percent}%` : matchController ? 'FLAC 검색 취소' : 'FLAC으로 듣기';
 }
 async function findFlac(video, action, source = {}) {
+  $('track-search-kind').value = 'tracks'; updateSearchKind();
   trackController?.abort(); trackController = new AbortController();
   const controller = trackController; matchController = controller; matchingAction = action; matchingSource = source.sourceRoundId ? source : null;
   selectMode('listen'); updateFlacButton();
