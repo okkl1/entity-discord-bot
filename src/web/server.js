@@ -223,7 +223,10 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
       void (pick.waitForComplete && stream.verified || stream.ready).then(info => {
         if (room.audioTrack?.stream !== stream) return;
         const startedAt = Date.now() + 1000;
-        state(room, { ...room.state, paused: Boolean(pick.handoffPaused), audio: { ...room.state.audio, ...info, duration: info.duration || pick.duration || null,
+        // A prefetched stream may have finished long after ready resolved.
+        // Its original ready snapshot is a fallback, never the live progress.
+        const latest = { ...info, ...stream.status };
+        state(room, { ...room.state, paused: Boolean(pick.handoffPaused), audio: { ...room.state.audio, ...latest, duration: latest.duration || room.state.audio.duration || pick.duration || null,
           startedAt, ...(pick.handoffPaused ? { pausedAt: startedAt } : {}) } }); audioTimer(room);
       }).catch(async error => {
         if (room.audioTrack?.stream !== stream) return;
