@@ -99,7 +99,9 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     clearTimeout(room.audioTimer); room.audioTimer = null;
     const audio = room.state.audio;
     if (!room.audioTrack || room.state.paused || !audio?.startedAt || !audio.duration) return;
-    const remaining = audio.duration - audio.startSeconds - Math.max(0, (Date.now() - audio.startedAt) / 1000);
+    // Include the shared future start, so automatic queue transitions cannot
+    // cut the final second or finish a short track before it begins.
+    const remaining = audio.duration - audio.startSeconds - (Date.now() - audio.startedAt) / 1000;
     const roundId = room.state.roundId;
     room.audioTimer = setTimeout(() => { if (room.state.roundId === roundId) finishPlayback(room); }, Math.min(2_147_483_647, Math.max(0, remaining * 1000) + 250));
     room.audioTimer.unref();

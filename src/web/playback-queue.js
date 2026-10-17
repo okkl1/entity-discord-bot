@@ -35,7 +35,6 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
   return { snapshot, prime,
     get size() { return entries.length; },
     add(kind, pick) {
-      if (entries.length >= 20) throw new Error('최대 20곡까지 예약할 수 있습니다.');
       if (entries.some(item => item.kind === kind && item.pick.id === pick.id)) throw new Error('이미 예약한 곡입니다.');
       const id = randomUUID(); entries.push({ id, kind, pick, status: 'waiting', owner: `${ownerPrefix}:${id}` }); onChange(); prime(); return id;
     },
