@@ -17,7 +17,8 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
         item.stream = await lossless.acquire(item.pick, item.owner);
         if (item.disposed) return;
         item.onProgress = progress => {
-          const status = progress.status === 'error' ? 'failed' : item.buffered || progress.status === 'complete' ? 'ready' : 'preparing';
+          const status = progress.status === 'error' ? 'failed' : item.buffered || progress.status === 'complete' ? 'ready'
+            : progress.status === 'queued' ? 'queued' : progress.status === 'verifying' ? 'verifying' : 'preparing';
           if (progress.status === 'error') item.failed = true;
           if (item.status === status && item.percent === progress.percent) return;
           item.status = status; item.percent = progress.percent;
@@ -25,7 +26,7 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
         };
         item.stream.events.on('progress', item.onProgress); item.onProgress(item.stream.status);
         void (item.pick.waitForComplete && item.stream.verified || item.stream.ready).then(() => {
-          if (item.disposed) return; item.buffered = true; item.status = 'ready';
+          if (item.disposed || item.failed) return; item.buffered = true; item.status = 'ready';
           if (!item.claimed) onChange();
         }).catch(() => { item.failed = true; item.status = 'failed'; if (!item.disposed && !item.claimed) onChange(); });
       } catch { item.status = 'later'; if (!item.disposed && !item.claimed) onChange(); }

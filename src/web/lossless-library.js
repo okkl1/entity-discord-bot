@@ -49,7 +49,7 @@ export function startupBufferBytes(size, duration, speed, { initialBytes = 512 *
   return Math.min(size, Math.ceil(Math.max(initialBytes, playbackRate * reserve, deficit)));
 }
 
-export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollMs = 250, initialBytes = 512 * 1024, initialBufferSeconds = 16,
+export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollMs = resources.compact ? 1000 : 250, initialBytes = 512 * 1024, initialBufferSeconds = 16,
   idleMs = resources.compact ? 120_000 : 0,
   waitForComplete = false, verify = verifyFlacFile, verifyPrefix = (path, info, options) => verifyFlacFile(path, info, { ...options, seconds: 2 }),
   waitMs = 10 * 60_000, stallMs = 90_000, cacheLimitBytes = 512 * 1024 * 1024, minFreeBytes = (() => { const mb = Number(process.env.LOSSLESS_MIN_FREE_MB); return Number.isFinite(mb) && mb >= 0 && process.env.LOSSLESS_MIN_FREE_MB !== undefined ? mb * 1024 ** 2 : 2 * 1024 ** 3; })(),
@@ -112,13 +112,24 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
     try { await initialized; } catch (error) { initialized = null; throw error; }
   }
   async function fileFor(stream) {
-    for (const path of [stream.paths.complete, stream.paths.incomplete]) {
-      try { const value = await stat(await checkedPath(path)); if (value.isFile()) return { path, size: value.size }; }
+    const first = stream.filePath || stream.paths.incomplete;
+    const second = first === stream.paths.complete ? stream.paths.incomplete : stream.paths.complete;
+    // Prefer the last existing location. Keep path validation, and recheck the
+    // first location in case the native final rename raced both stat calls.
+    for (const path of [first, second, first]) {
+      try { const value = await stat(await checkedPath(path)); if (value.isFile()) { stream.filePath = path; return { path, size: value.size }; } }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     return null;
   }
-  function update(stream, patch) { Object.assign(stream.status, patch); stream.events.emit('progress', { ...stream.status }); }
+  function update(stream, patch) {
+    const changed = Object.entries(patch).some(([name, value]) => !Object.is(stream.status[name], value));
+    Object.assign(stream.status, patch);
+    // Keep a one-second heartbeat for the shared starvation guard, without
+    // repeatedly broadcasting identical queued states to every participant.
+    if (!changed && Date.now() - (stream.publishedAt || 0) < 1000) return;
+    stream.publishedAt = Date.now(); stream.events.emit('progress', { ...stream.status });
+  }
   async function audioOffset(path, available, size) {
     const handle = await open(path, 'r');
     try {
@@ -139,17 +150,19 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
     await mkdir(join(root, 'manifests'), { recursive: true });
     await writeFile(stream.paths.manifest, JSON.stringify({ id: stream.id, track: stream.track }), { mode: 0o600 });
     stream.enqueuing = client.enqueue(stream.track, stream.id); await stream.enqueuing;
-    const started = Date.now(); let ready = false, lastBytes = 0, lastProgress = started;
-    while (!signal.aborted) {
+    const started = Date.now(); let ready = false, lastBytes = 0, lastProgress = started, prefixTask, prefixError;
+    const prefixController = new AbortController();
+    try { while (!signal.aborted) {
+      if (prefixError) throw prefixError;
       if (Date.now() - started > waitMs) throw new Error('Soulseek 전송 대기가 길어졌습니다. 다른 검색 결과를 선택해주세요.');
       const transfer = await client.transfer(stream.id, { signal, timeoutMs: 5000 });
       if (!transfer) throw new Error('음원 전송을 찾지 못했습니다.');
       if (/Errored|Rejected|Cancelled|TimedOut/i.test(String(transfer.state))) throw Object.assign(new Error('상대방의 음원 전송이 중단됐습니다. 다른 검색 결과를 선택해주세요.'), { kind: 'peer_unavailable' });
-      const file = await fileFor(stream), bytes = Math.min(stream.track.size, file?.size ?? 0);
+      const file = await fileFor(stream), bytes = Math.min(stream.track.size, file?.size ?? lastBytes);
       if (file?.size > stream.track.size) throw new Error('음원 크기가 검색 결과와 다릅니다. 다른 파일을 선택해주세요.');
       const complete = bytes === stream.track.size && /Succeeded/i.test(String(transfer.state));
       if (bytes > lastBytes) { lastBytes = bytes; lastProgress = Date.now(); }
-      else if (bytes && !complete && Date.now() - lastProgress >= stallMs) throw Object.assign(new Error('음원 전송이 90초 이상 진행되지 않아 임시 캐시를 정리합니다. 다른 검색 결과를 선택해주세요.'), { kind: 'peer_stalled' });
+      else if (!complete && Date.now() - lastProgress >= stallMs) throw Object.assign(new Error('음원 전송이 진행되지 않아 임시 캐시를 정리합니다. 다른 검색 결과를 선택해주세요.'), { kind: 'peer_stalled' });
       if (file && bytes >= 42 && !stream.info) {
         let handle;
         try { handle = await open(file.path, 'r'); }
@@ -163,9 +176,12 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
       const offset = stream.audioOffset ?? stream.track.size;
       const bufferTarget = waitForComplete ? stream.track.size : offset + startupBufferBytes(stream.track.size - offset, stream.info?.duration || stream.track.duration,
         Math.max(0, Number(transfer.averageSpeed) || 0) * 0.8, { initialBytes, bufferSeconds: initialBufferSeconds });
-      update(stream, { bytes, bufferTarget, percent: Math.floor(bytes / stream.track.size * 100), status: complete ? 'verifying' : bytes ? 'receiving' : 'queued',
+      update(stream, { bytes, bufferTarget, audioOffset: stream.audioOffset, percent: Math.floor(bytes / stream.track.size * 100), status: complete ? 'verifying' : bytes ? 'receiving' : 'queued',
         ...(stream.info ?? {}) });
-      if (complete) {
+      if (complete && file) {
+        // Finish or cancel the short check before starting a full decode. A
+        // queued prefix must not hold a second conversion or stale file handle.
+        prefixController.abort(); await prefixTask;
         let validation;
         try { validation = await verify(file.path, stream.info, { signal }); }
         catch (error) { if ((await fileFor(stream))?.path !== file.path) continue; throw error; }
@@ -175,19 +191,24 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
         if (!ready) { ready = true; stream.resolveReady({ ...stream.status }); }
         return;
       }
-      if (!waitForComplete && !ready && stream.info && bytes >= bufferTarget) {
-        try { await verifyPrefix(file.path, stream.info, { signal }); }
-        catch (error) {
-          // A completed transfer can move the cache while the decoder opens it.
-          // Recheck the final path on the next poll rather than reject a good song.
-          if ((await fileFor(stream))?.path !== file.path) continue;
-          throw error;
-        }
-        signal.throwIfAborted(); update(stream, { integrity: 'pending' });
-        ready = true; stream.resolveReady({ ...stream.status });
+      if (file && !waitForComplete && !ready && !prefixTask && stream.info && bytes >= bufferTarget) {
+        // Continue observing disk progress while FFmpeg waits for a slot or
+        // validates. Otherwise a reservation appears frozen at its old percent.
+        prefixTask = (async () => {
+          try {
+            await verifyPrefix(file.path, stream.info, { signal: AbortSignal.any([signal, prefixController.signal]) });
+            if (signal.aborted || prefixController.signal.aborted) return;
+            update(stream, { integrity: 'pending' });
+            ready = true; stream.resolveReady({ ...stream.status });
+          } catch (error) {
+            if (signal.aborted || prefixController.signal.aborted) return;
+            try { if ((await fileFor(stream))?.path === file.path) prefixError = error; }
+            catch (pathError) { prefixError = pathError; }
+          } finally { prefixTask = null; }
+        })();
       }
       await delay(pollMs, undefined, { signal });
-    }
+    } } finally { prefixController.abort(); await prefixTask; }
   }
   async function dispose(stream) {
     if (stream.disposal) return stream.disposal;
@@ -276,13 +297,16 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
           try { handle = await open(file.path, 'r'); }
           catch (error) { if (error.code !== 'ENOENT' || attempt === 2) throw error; }
         }
-        let position = range.start, stalled = Date.now(); const buffer = Buffer.alloc(64 * 1024);
+        let position = range.start, stalled = Date.now(), knownSize = 0; const buffer = Buffer.alloc(64 * 1024);
         while (position <= range.end && !signal.aborted) {
           if (stream.error) throw stream.error;
           // Completion can arrive while stat is in flight. Only reject an empty
           // range after a stat that began with the final file already complete.
           const completedBeforeStat = stream.complete;
-          const available = (await handle.stat()).size - position;
+          // Reuse the known extent until consumed, rather than issue one stat
+          // for every 64 KiB sent to each listener. Refresh at the growing edge.
+          if (knownSize <= position) knownSize = (await handle.stat()).size;
+          const available = knownSize - position;
           if (available <= 0) {
             if (Date.now() - stalled > 90_000 || completedBeforeStat) throw new Error('음원 수신이 중단됐습니다.');
             await delay(pollMs, undefined, { signal }); continue;

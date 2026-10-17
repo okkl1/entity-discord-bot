@@ -203,10 +203,12 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         const time = Date.now();
         if (audio.startedAt && time >= audio.startedAt && audio.duration && audio.size && Number.isFinite(audio.bytes)) {
           const position = audio.startSeconds + Math.max(0, ((paused ? audio.pausedAt : time) - audio.startedAt) / 1000);
-          const ahead = audio.duration * audio.bytes / audio.size - position;
-          if (!paused && progress.status !== 'complete' && ahead < 3) {
+          const offset = audio.audioOffset || 0;
+          const receivedSeconds = audio.duration * Math.max(0, audio.bytes - offset) / Math.max(1, audio.size - offset);
+          const ahead = receivedSeconds - position, receivedAll = audio.bytes >= audio.size;
+          if (!paused && !receivedAll && progress.status !== 'complete' && ahead < 3) {
             paused = buffering = true; audio.pausedAt = time;
-          } else if (buffering && (ahead >= 12 || progress.status === 'complete')) {
+          } else if (buffering && (ahead >= Math.min(12, audio.duration - position) || receivedAll || progress.status === 'complete')) {
             paused = buffering = false; audio.startSeconds = position; audio.startedAt = time + 1000; delete audio.pausedAt;
           }
         }

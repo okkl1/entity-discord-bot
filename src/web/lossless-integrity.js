@@ -21,7 +21,7 @@ export async function verifyFlacFile(path, info, { signal, timeoutMs = 120_000, 
   // the whole-stream MD5 and per-packet byte counts, not the audio payload.
   // Unusual 12/20-bit files retain the original sample-alignment validation.
   const internalHash = nativeHash && shift === 0;
-  const release = await acquireTranscode({ signal });
+  const release = await acquireTranscode({ signal, priority: seconds > 0 });
   const controller = new AbortController(), combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   const timer = setTimeout(() => controller.abort(), timeoutMs); timer.unref();
   const child = trackMediaProcess('ffmpeg', spawn(ffmpegPath, ['-nostdin', '-hide_banner', '-v', 'error', '-xerror', '-err_detect', 'explode', ...audioInputOptions(),

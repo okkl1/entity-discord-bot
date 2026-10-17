@@ -92,7 +92,7 @@ function renderQueue(queue) {
   if (!queue.length) $('playback-queue').append(textElement('li', '검색 결과의 예약 버튼으로 다음 곡을 골라두세요.', 'small queue-empty'));
   for (const [index, item] of queue.entries()) {
     const row = document.createElement('li'), copy = document.createElement('div');
-    const labels = { waiting: '순서 대기', preparing: `미리 받는 중 · ${item.percent}%`, ready: `재생 준비됨 · ${item.percent}% 수신`, later: '재생할 때 준비', failed: '전송 중단 · 다음 곡으로 건너뜀' };
+    const labels = { waiting: '순서 대기', queued: '공유자 전송 대기 · 0%', preparing: `미리 받는 중 · ${item.percent}%`, verifying: '100% 수신 · 음원 검사 중', ready: `재생 준비됨 · ${item.percent}% 수신`, later: '재생할 때 준비', failed: '전송 중단 · 다음 곡에서 다른 공유자 확인' };
     copy.append(textElement('strong', `${index + 1}. ${item.title}`), textElement('small', `${item.kind === 'listen' ? 'FLAC' : '유튜브'} · ${labels[item.status] || '순서 대기'}`));
     const remove = textElement('button', '제거', 'quiet'); remove.type = 'button'; remove.disabled = !joined;
     remove.onclick = () => send({ type: 'queueRemove', id: item.id }); row.append(copy, remove); $('playback-queue').append(row);
@@ -129,7 +129,7 @@ function applyState(next) {
   if (next.phase === 'listen' && document.activeElement !== $('seek-seconds')) $('seek-seconds').value = Math.floor(losslessPosition(next));
   $('audio-hint').textContent = next.preparingKind === 'listen' ? '♫ FLAC 음원을 준비하고 있어요' : next.phase === 'listen' ? `FLAC 원본 · ${next.audio.bitDepth || '?'}bit / ${next.audio.sampleRate ? next.audio.sampleRate / 1000 : '?'}kHz` : ['reveal', 'watch'].includes(next.phase) ? '♫ 영상과 소리는 이 브라우저에서 재생돼요' : '♫ 노래는 디스코드에서 함께 듣고 있어요';
   $('lossless-status').hidden = next.phase !== 'listen'; $('audio-enable').hidden = next.phase !== 'listen'; $('audio-enable').disabled = !joined;
-  if (next.audio) $('audio-progress').textContent = next.audio.status === 'retrying' ? '다른 공유자의 같은 곡을 찾는 중…' : next.audio.status === 'verifying' ? '수신 완료 · 전체 무결성 확인 중' : next.audio.startedAt ? `수신 ${next.audio.percent}% · ${(next.audio.bytes / 1024 / 1024).toFixed(1)} / ${(next.audio.size / 1024 / 1024).toFixed(1)}MB` : next.audio.bytes ? `재생 준비 · ${next.audio.percent}% 수신` : '상대방 업로드 대기열에서 기다리고 있어요';
+  if (next.audio) $('audio-progress').textContent = next.audio.status === 'retrying' ? '다른 공유자의 같은 곡을 찾는 중…' : next.audio.status === 'verifying' ? '수신 완료 · 전체 무결성 확인 중' : next.audio.startedAt ? `수신 ${next.audio.percent}% · ${(next.audio.bytes / 1024 / 1024).toFixed(1)} / ${(next.audio.size / 1024 / 1024).toFixed(1)}MB` : next.audio.bytes ? `재생 준비 · ${next.audio.percent}% 수신${next.audio.bufferTarget && next.audio.size ? ` · 시작 기준 약 ${Math.min(100, Math.ceil(next.audio.bufferTarget / next.audio.size * 100))}%` : ''}` : '상대방 업로드 대기열에서 기다리고 있어요';
   for (const button of $('track-results').querySelectorAll('button')) button.disabled = !joined || Boolean(next.preparing);
   $('youtube-hint').textContent = next.preparing ? '이전 게임을 정리하고 있어요.' : '영상 선택 시 진행 중인 퀴즈가 종료됩니다.';
   for (const button of $('youtube-results').querySelectorAll('button')) button.disabled = !joined || Boolean(next.preparing);
@@ -329,7 +329,7 @@ async function searchTracks() {
   clearTrackResults('Soulseek에서 FLAC를 찾는 중… 첫 연결은 조금 더 걸릴 수 있어요.');
   $('track-search-status').textContent = '검색 중… 결과가 도착하는 대로 표시합니다.';
   try {
-    const params = new URLSearchParams({ q: $('track-search').value, artist: $('track-artist').value });
+    const params = new URLSearchParams({ q: $('track-search').value });
     const response = await fetch(`/api/rooms/${roomId}/tracks?${params}`, {
       signal: controller.signal, headers: { Accept: 'application/x-ndjson' } });
     const data = await readTrackSearchResponse(response, { signal: controller.signal, onProgress: data => {
@@ -422,8 +422,7 @@ async function findFlac(video, action, source = {}) {
     const response = await fetch('/api/rooms/' + roomId + '/tracks?' + params, {
       signal: controller.signal, headers: { Accept: 'application/x-ndjson' } });
     const display = data => {
-      if (data.query && document.activeElement !== $('track-search')) $('track-search').value = data.identity?.title || data.query;
-      if (data.identity && document.activeElement !== $('track-artist')) $('track-artist').value = data.identity.artist;
+      if (data.query && document.activeElement !== $('track-search')) $('track-search').value = data.identity ? `${data.identity.artist} - ${data.identity.title}` : data.query;
       showMusicIdentity(data.identity);
       if (data.stage === 'identity') $('track-search-status').textContent = '영상의 가수·곡명을 확인하는 중…';
       if (data.hits.length) renderTrackResults(data.hits, source);
