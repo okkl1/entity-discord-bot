@@ -1,7 +1,7 @@
 import { ffmpegFailure } from '../ffmpeg.js';
 // Wait for real PCM output, then report later playback failures to the round.
 export function monitorPlayback(player, ff, source, stream, {
-  timeoutMs = 20_000, onFailure = () => {},
+  timeoutMs = 20_000, onFailure = () => {}, output = ff.stdout, minBytes = 3840,
 } = {}) {
   let intentional = false
   let started = false
@@ -29,9 +29,9 @@ export function monitorPlayback(player, ff, source, stream, {
     resolveFailure(err)
   }
   const timer = setTimeout(() => fail(new Error("오디오 출력 대기 시간 초과")), timeoutMs)
-  listen(ff.stdout, "data", chunk => {
+  listen(output, "data", chunk => {
     bytes += chunk.length
-    if (!started && bytes >= 3840) {
+    if (!started && bytes >= minBytes) {
       started = true
       clearTimeout(timer)
       resolveReady()

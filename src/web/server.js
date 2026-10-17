@@ -51,9 +51,13 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
   const send = (ws, data) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     if (ws.bufferedAmount > 256 * 1024) { ws.close(1013, 'Connection too slow'); return; }
-    ws.send(JSON.stringify(data));
+    ws.send(typeof data === 'string' ? data : JSON.stringify(data));
   };
-  const broadcast = (room, data) => { for (const ws of room.clients.keys()) send(ws, data); };
+  const broadcast = (room, data) => {
+    if (!room.clients.size) return;
+    const payload = JSON.stringify(data);
+    for (const ws of room.clients.keys()) send(ws, payload);
+  };
   const entryChannelUrl = room => `https://discord.com/channels/${room.guildId}/${room.entryChannelId || room.textChannel?.id || room.voiceChannel.id}`;
   const presence = room => broadcast(room, { type: 'presence', players: [...room.clients.values()].map(p => ({ name: p.name, host: p.host })) });
   const state = (room, value) => {

@@ -25,11 +25,10 @@ import {
   resumePlayer,
 } from "./voice.js"
 import { AudioPlayerStatus, getVoiceConnection } from "@discordjs/voice"
-import { pingQuizPage } from "./machugi.js"
 import { PanelUpdateQueue } from "./panel-update-queue.js"
 import { EventEmitter } from "node:events"
 import { randomUUID } from "node:crypto"
-import { resources } from "../resource-profile.js"
+import { resources, backgroundWorkAllowed, onMemoryPressure } from "../resource-profile.js"
 import { deleteGameMessages, deleteGameMessageLater } from "./game-messages.js"
 
 const sessions = new Map()
@@ -111,6 +110,7 @@ export class QuizSession {
     this.player = createPlayer()
     this.player.setMaxListeners(30)
     this.cleanupFns = []
+    if (resources.compact) this.cleanupFns.push(onMemoryPressure(() => this.cancelPrefetch()))
 
     this.panelMsg = null
     this.btnCollector = null
@@ -203,13 +203,14 @@ export class QuizSession {
   }
 
   warmQuestions(index) {
+    const lookahead = backgroundWorkAllowed() ? resources.quizLookahead : 0
     for (const [position, controller] of this.prefetchJobs) {
-      if (position < index || position > index + resources.quizLookahead) {
+      if (position < index || position > index + lookahead) {
         controller.abort()
         this.prefetchJobs.delete(position)
       }
     }
-    for (let position = index; position <= index + resources.quizLookahead && position < this.questions.length; position++) {
+    for (let position = index; position <= index + lookahead && position < this.questions.length; position++) {
       if (this.prefetchJobs.has(position)) continue
       const controller = new AbortController()
       this.prefetchJobs.set(position, controller)
@@ -522,7 +523,6 @@ export class QuizSession {
       components: [this.makeButtons()],
     })
     this.setupButtons()
-    pingQuizPage(this.quiz.id).catch(() => {})
 
     for (let i = 0; i < this.questions.length; i++) {
       if (this.stopped) break
@@ -540,6 +540,14 @@ export class QuizSession {
   }
 
   /* ---------- round ---------- */
+  recordPlaybackFailure(error) {
+    this.playbackFailures++
+    if (["YOUTUBE_AUTH_REQUIRED", "AUDIO_PROCESS_TERMINATED", "ENOENT", "EACCES", "ENOEXEC"].includes(error?.code)) {
+      this.playbackError = error.message
+      this.stopped = true
+      this.cancelPrefetch()
+    }
+  }
   async runRound(idx, question) {
     const controller = new AbortController()
     const start = Number(question.start_seconds || 0)
@@ -555,12 +563,7 @@ export class QuizSession {
       clip = await playYouTubeClip(this.player, clipInfo)
     } catch (err) {
       if (controller.signal.aborted) return
-      this.playbackFailures++
-      if (["YOUTUBE_AUTH_REQUIRED", "AUDIO_PROCESS_TERMINATED", "ENOENT", "EACCES", "ENOEXEC"].includes(err.code)) {
-        this.playbackError = err.message
-        this.stopped = true
-        this.cancelPrefetch()
-      }
+      this.recordPlaybackFailure(err)
       console.error("[v0] clip error:", err)
       void this.editPanel({
         embeds: [new EmbedBuilder().setColor(0xef4444)
@@ -634,7 +637,7 @@ export class QuizSession {
     // 결과 표시
     if (result.reason === "stopped") return
     if (result.reason === "unplayable") {
-      this.playbackFailures++
+      this.recordPlaybackFailure(result.error)
       console.warn(`[v0] skipping unplayable video ${question.video_id}:`, result.error?.message ?? "재생 중단")
       return
     }

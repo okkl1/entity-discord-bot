@@ -2,14 +2,14 @@
 import { ClipCache } from "./clip-cache.js"
 
 export class AudioUrlCache {
-  constructor(load, { ttlMs = 15 * 60_000, maxEntries = 100, now = Date.now } = {}) {
+  constructor(load, { ttlMs = 15 * 60_000, maxEntries = 100, now = Date.now, concurrency = 2 } = {}) {
     this.load = load
     this.ttlMs = ttlMs
     this.maxEntries = maxEntries
     this.now = now
     this.entries = new Map()
     this.requests = new ClipCache(async ({ key }, signal) => ({ url: await this.load(key, signal), bytes: 0 }),
-      { concurrency: 2, maxEntries: 0, now })
+      { concurrency, maxEntries: 0, now })
     this.pending = this.requests.jobs
   }
 

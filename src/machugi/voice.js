@@ -26,11 +26,12 @@ import { ffmpegPath } from "../ffmpeg.js"
 import { AudioUrlCache } from "./audio-url-cache.js"
 import { resolveYtDlpPath } from "./yt-dlp-path.js"
 import { ytDlpOptions, youtubeFailure } from "./yt-dlp-options.js"
-import { clipLoopFilter } from "./audio-loop.js"
+import prism from "prism-media"
+import { extractionSlots, runExtraction, acquireTranscode, audioInputOptions, opusOutputOptions, trackMediaProcess } from "../media-resources.js"
 import { monitorPlayback } from "./playback-monitor.js"
 import { ClipCache } from "./clip-cache.js"
 import { resources, onMemoryPressure } from "../resource-profile.js"
-import { encodeClip, OpusPacketStream, MAX_PREPARED_SECONDS } from "./prepared-audio.js"
+import { encodeClip, OpusPacketStream, GrowingOpusLoop, MAX_PREPARED_SECONDS } from "./prepared-audio.js"
 import {
   createAudioPlayer,
   createAudioResource,
@@ -53,7 +54,7 @@ const YT_DLP_PATH =
 
 let cryptoReady = null
 let reportPrinted = false
-const audioUrls = new AudioUrlCache(fetchAudioUrl)
+const audioUrls = new AudioUrlCache(fetchAudioUrl, { concurrency: resources.compact ? 1 : 2 })
 const unavailableVideos = new Map()
 const preparedClips = new ClipCache(async ({ videoId, startSeconds, duration }, signal) => {
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`
@@ -63,8 +64,10 @@ const preparedClips = new ClipCache(async ({ videoId, startSeconds, duration }, 
   } catch (err) {
     signal.throwIfAborted()
     if (youtubeFailure(err) || isUnavailableError(err) || unavailableVideos.get(videoUrl) > Date.now()) throw err
-    const source = spawn(YT_DLP_PATH, [...ytDlpOptions(), "--no-playlist", "-f", "bestaudio", "-o", "-", videoUrl],
-      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+    const release = await extractionSlots.acquire({ signal, priority: true })
+    const source = trackMediaProcess('ytdlp', spawn(YT_DLP_PATH, [...ytDlpOptions(), "--no-playlist", "-f", "bestaudio", "-o", "-", videoUrl],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }))
+    source.once('close', release)
     return encodeClip(["-i", "pipe:0", "-ss", String(startSeconds)], duration, { signal, source })
   }
   signal.throwIfAborted()
@@ -299,13 +302,13 @@ async function fetchAudioUrl(videoUrl, signal) {
   const startedAt = Date.now()
   console.log(`[v0] yt-dlp: getting audio URL for ${videoUrl}`)
   try {
-    const { stdout } = await execFileAsync(YT_DLP_PATH, [
+    const { stdout } = await runExtraction(() => execFileAsync(YT_DLP_PATH, [
       ...ytDlpOptions(),
       "--no-playlist",
       "-f", "bestaudio",
       "--get-url",
       videoUrl,
-    ], { timeout: 15_000, windowsHide: true, signal })
+      ], { timeout: 15_000, windowsHide: true, signal }), { signal, priority: true })
 
     const url = stdout.trim()
     if (!url) throw new Error("yt-dlp returned empty URL")
@@ -366,61 +369,62 @@ export async function playYouTubeClip(player, { videoId, startSeconds, endSecond
   signal?.throwIfAborted()
 
   // ffmpeg가 HTTP URL에서 직접 읽음 — input seeking 가능
-  const ff = spawn(
+  const release = await acquireTranscode({ signal, priority: true })
+  const ff = trackMediaProcess('ffmpeg', spawn(
     ffmpegPath,
     [
       "-hide_banner",
       "-loglevel", "warning",
+      "-nostdin", ...audioInputOptions(),
       "-ss", String(startSeconds),
-      "-t", String(duration),
       "-i", audioUrl,
-      ...(loop ? ["-af", clipLoopFilter(0, duration)] : []),
-      "-f", "s16le",
-      "-ar", "48000",
-      "-ac", "2",
-      "pipe:1",
+      "-t", String(duration), "-af", "volume=0.6",
+      ...opusOutputOptions(),
     ],
     { stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
-  )
+  ), release)
 
-  return setupFfmpegPlayer(player, ff, null, () => audioUrls.invalidate(videoUrl, audioUrl), signal)
+  return setupFfmpegPlayer(player, ff, null, () => audioUrls.invalidate(videoUrl, audioUrl), signal, loop)
 }
 
 /**
  * Fallback: yt-dlp → pipe → ffmpeg
  * (--get-url 실패 시)
  */
-function playYouTubeClipPipe(player, { videoId, startSeconds, duration, videoUrl, loop = false, signal }) {
+async function playYouTubeClipPipe(player, { videoId, startSeconds, duration, videoUrl, loop = false, signal }) {
   console.log(`[v0] voice: pipe fallback for ${videoUrl}`)
 
-  const ytdlp = spawn(YT_DLP_PATH, [
+  const release = await extractionSlots.acquire({ signal, priority: true })
+  const ytdlp = trackMediaProcess('ytdlp', spawn(YT_DLP_PATH, [
     ...ytDlpOptions(),
     "--no-playlist",
     "-f", "bestaudio",
     "-o", "-",
     videoUrl,
-  ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
+  ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true }))
+  ytdlp.once('close', release)
+  const sourceFailure = new AbortController()
+  ytdlp.on('error', error => sourceFailure.abort(error))
 
   ytdlp.stderr.on("data", (chunk) => {
     console.log(`[v0] yt-dlp stderr: ${chunk.toString().trim()}`)
   })
 
-  const ff = spawn(
+  let releaseTranscode
+  try { releaseTranscode = await acquireTranscode({ signal: AbortSignal.any([sourceFailure.signal, ...(signal ? [signal] : [])]), priority: true }) }
+  catch (error) { ytdlp.kill(); throw error }
+  const ff = trackMediaProcess('ffmpeg', spawn(
     ffmpegPath,
     [
       "-hide_banner",
       "-loglevel", "warning",
+      "-nostdin", ...audioInputOptions(),
       "-i", "pipe:0",
-      ...(loop
-        ? ["-af", clipLoopFilter(startSeconds, duration)]
-        : ["-ss", String(startSeconds), "-t", String(duration)]),
-      "-f", "s16le",
-      "-ar", "48000",
-      "-ac", "2",
-      "pipe:1",
+      "-ss", String(startSeconds), "-t", String(duration), "-af", "volume=0.6",
+      ...opusOutputOptions(),
     ],
     { stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
-  )
+  ), releaseTranscode)
 
   // yt-dlp stdout → ffmpeg stdin
   ytdlp.stdout.pipe(ff.stdin)
@@ -440,21 +444,27 @@ function playYouTubeClipPipe(player, { videoId, startSeconds, duration, videoUrl
     console.error("[v0] ffmpeg stdin error:", err.message)
   })
 
-  return setupFfmpegPlayer(player, ff, ytdlp, undefined, signal)
+  return setupFfmpegPlayer(player, ff, ytdlp, undefined, signal, loop)
 }
 
 /**
  * ffmpeg 프로세스의 stdout을 AudioPlayer에 연결하는 공통 로직.
  */
-async function setupFfmpegPlayer(player, ff, ytdlpProcess, onFailure = () => {}, signal) {
-  const passthrough = new PassThrough()
-  const monitor = monitorPlayback(player, ff, ytdlpProcess, passthrough, { onFailure })
+async function setupFfmpegPlayer(player, ff, ytdlpProcess, onFailure = () => {}, signal, loop = false) {
+  const demuxer = new prism.opus.OggDemuxer()
+  const passthrough = loop ? new GrowingOpusLoop() : new PassThrough({ objectMode: true, highWaterMark: 4 })
+  const monitor = monitorPlayback(player, ff, ytdlpProcess, passthrough, { onFailure, output: demuxer, minBytes: 1 })
+  demuxer.on('error', error => passthrough.destroy(error))
+  if (loop) {
+    demuxer.on('data', packet => passthrough.append(packet))
+    demuxer.on('end', () => passthrough.finishInput())
+  } else demuxer.pipe(passthrough)
 
   // ffmpeg stderr 로깅
   let ffmpegStderr = ""
   ff.stderr.on("data", (chunk) => {
     const msg = chunk.toString()
-    ffmpegStderr += msg
+    ffmpegStderr = (ffmpegStderr + msg).slice(-2000)
     console.log(`[v0] ffmpeg stderr: ${msg.trim()}`)
   })
 
@@ -467,7 +477,7 @@ async function setupFfmpegPlayer(player, ff, ytdlpProcess, onFailure = () => {},
     }
   })
 
-  ff.stdout.pipe(passthrough)
+  ff.stdout.pipe(demuxer)
 
   ff.on("error", (err) => {
     onFailure()
@@ -490,10 +500,9 @@ async function setupFfmpegPlayer(player, ff, ytdlpProcess, onFailure = () => {},
   })
 
   const resource = createAudioResource(passthrough, {
-    inputType: StreamType.Raw,
-    inlineVolume: true,
+    inputType: StreamType.Opus,
+    silencePaddingFrames: 2,
   })
-  resource.volume?.setVolume(0.6)
 
   // AudioPlayer 상태 전이 로깅
   const playerStateHandler = (oldState, newState) => {
@@ -509,9 +518,14 @@ async function setupFfmpegPlayer(player, ff, ytdlpProcess, onFailure = () => {},
   player.play(resource)
   console.log(`[v0] voice: player.play() called`)
 
+  let cleaned = false
   const cleanup = () => {
+    if (cleaned) return
+    cleaned = true
     signal?.removeEventListener("abort", abortPlayback)
     monitor.cleanup()
+    ff.stdout.unpipe(demuxer)
+    demuxer.destroy()
     player.off("stateChange", playerStateHandler)
     player.off("error", playerErrorHandler)
     try {

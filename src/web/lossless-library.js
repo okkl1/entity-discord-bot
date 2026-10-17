@@ -5,6 +5,7 @@ import { resolve, relative, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSoulseekRuntime } from './soulseek-runtime.js';
 import { verifyFlacFile } from './lossless-integrity.js';
+import { resources } from '../resource-profile.js';
 
 const uuid = /^[a-f0-9-]{36}$/;
 const maxFile = 512 * 1024 * 1024;
@@ -49,10 +50,25 @@ export function startupBufferBytes(size, duration, speed, { initialBytes = 512 *
 }
 
 export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollMs = 250, initialBytes = 512 * 1024, initialBufferSeconds = 16,
+  idleMs = resources.compact ? 120_000 : 0,
   waitForComplete = false, verify = verifyFlacFile, verifyPrefix = (path, info, options) => verifyFlacFile(path, info, { ...options, seconds: 2 }),
   waitMs = 10 * 60_000, stallMs = 90_000, cacheLimitBytes = 512 * 1024 * 1024, minFreeBytes = (() => { const mb = Number(process.env.LOSSLESS_MIN_FREE_MB); return Number.isFinite(mb) && mb >= 0 && process.env.LOSSLESS_MIN_FREE_MB !== undefined ? mb * 1024 ** 2 : 2 * 1024 ** 3; })(),
   freeSpace = async path => { const disk = await statfs(path); return disk.bavail * disk.bsize; } } = {}) {
   const root = resolve(runtime.cacheRoot), streams = new Map(), keys = new Map(); let initialized, client, closing = false;
+  let activeOperations = 0, idleTimer, suspending;
+  function armIdle() {
+    clearTimeout(idleTimer);
+    if (closing || activeOperations || streams.size || !initialized || !runtime.suspend || !(idleMs > 0)) return;
+    idleTimer = setTimeout(() => {
+      if (closing || activeOperations || streams.size) return;
+      initialized = null; client = null;
+      suspending = runtime.suspend().catch(error => console.warn('[lossless] 유휴 연결 정리:', error.message));
+    }, idleMs); idleTimer.unref();
+  }
+  async function operate(task) {
+    activeOperations++; clearTimeout(idleTimer);
+    try { return await task(); } finally { activeOperations--; armIdle(); }
+  }
   async function checkedPath(path) {
     const rel = relative(root, resolve(path)); if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error('Cache path escaped its root.');
     // Verify every existing parent; a junction must never redirect cleanup elsewhere.
@@ -81,6 +97,9 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
     await remove(paths.manifest);
   }
   async function initialize() {
+    if (suspending) { await suspending; suspending = null; }
+    if (closing) throw new Error('음악 서비스를 종료하고 있습니다.');
+    if (client?.controller?.signal.aborted) { initialized = null; client = null; }
     if (initialized) return initialized;
     initialized = (async () => {
       client = await runtime.start(); await mkdir(join(root, 'manifests'), { recursive: true });
@@ -176,16 +195,20 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
       stream.controller.abort(); const cancelled = new Error('음원 재생이 취소됐습니다.'); stream.rejectReady(cancelled); stream.rejectVerified(cancelled);
       for (const response of stream.responses) response.destroy();
       await stream.task?.catch(() => {}); await stream.enqueuing?.catch(() => {});
-      await clean({ id: stream.id, track: stream.track });
-      streams.delete(stream.id); if (keys.get(stream.key) === stream) keys.delete(stream.key);
-      stream.events.removeAllListeners();
+      try { await clean({ id: stream.id, track: stream.track }); }
+      finally {
+        // Keep a recovery manifest on disk when native cancellation fails, but
+        // do not retain failed transfer objects and listeners in RAM forever.
+        streams.delete(stream.id); if (keys.get(stream.key) === stream) keys.delete(stream.key);
+        stream.events.removeAllListeners(); armIdle();
+      }
     })(); return stream.disposal;
   }
   return {
     configured: () => runtime.configured(),
-    async warmup() { if (!closing && await runtime.configured()) await initialize(); },
-    async search(query, options) { await initialize(); if (closing) throw new Error('음악 서비스를 종료하고 있습니다.'); return client.search(query, options); },
-    async acquire(track, owner) {
+    warmup() { return operate(async () => { if (!closing && await runtime.configured()) await initialize(); }); },
+    search(query, options) { return operate(async () => { await initialize(); if (closing) throw new Error('음악 서비스를 종료하고 있습니다.'); return client.search(query, options); }); },
+    acquire(track, owner) { return operate(async () => {
       if (closing) throw new Error('음악 서비스를 종료하고 있습니다.');
       if (!Number.isSafeInteger(track.size) || track.size < 42 || track.size > maxFile) throw new Error('음원 파일 크기를 확인해주세요.');
       await initialize();
@@ -224,7 +247,7 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
         queueMicrotask(() => { void dispose(stream).catch(error => console.warn('[lossless] 실패한 음원 캐시 정리:', error.message)); });
       });
       return stream;
-    },
+    }); },
     async release(id, owner) {
       const stream = streams.get(id); if (!stream) return;
       stream.owners.delete(owner); if (!stream.owners.size) await dispose(stream);
@@ -276,6 +299,6 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
         else if (!res.destroyed) res.destroy();
       } finally { await handle?.close().catch(() => {}); stream.responses.delete(res); }
     },
-    async close() { closing = true; await initialized?.catch(() => {}); await Promise.allSettled([...streams.values()].map(dispose)); client?.close?.(); await runtime.close(); },
+    async close() { closing = true; clearTimeout(idleTimer); await suspending?.catch(() => {}); await initialized?.catch(() => {}); await Promise.allSettled([...streams.values()].map(dispose)); client?.close?.(); await runtime.close(); },
   };
 }

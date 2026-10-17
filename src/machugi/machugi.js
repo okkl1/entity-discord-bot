@@ -150,13 +150,3 @@ export async function fetchMusicQuestions({
   return results.filter(Boolean)
 }
 
-/**
- * machugi.io의 퀴즈 페이지를 GET해 플레이 기록을 흉내냄. 실패해도 무해.
- */
-export async function pingQuizPage(quizId) {
-  try {
-    await fetch(`${DEFAULT_ORIGIN}/quiz/${encodeURIComponent(quizId)}`, {
-      headers: { "User-Agent": "Mozilla/5.0 (machugi-bot)" },
-    })
-  } catch {}
-}

@@ -1,11 +1,9 @@
 import 'dotenv/config';
 import { Client, Events, GatewayIntentBits, Partials } from 'discord.js';
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
 import { handleMessage } from './machugi/commands.js';
 import { hasSession, getSession, quizEvents, stopSession } from './machugi/quiz-session.js';
 import { registerRadio, isRadioActive, stopRadio, stopAllRadio } from './chzzk/radio.js';
-import { registerBinance } from './binance/plugin.js';
+import { registerHelp } from './help.js';
 import { createQuizWebServer } from './web/server.js';
 import { registerWebCommands } from './web/commands.js';
 import { startPublicTunnel } from './web/tunnel.js';
@@ -15,6 +13,7 @@ import { createEntryPanels, createWebEntryPublisher } from './web/entry-panel.js
 import { resources, RELEASE } from './resource-profile.js';
 import { startMemoryMonitor } from './runtime-memory.js';
 import { ffmpegPath } from './ffmpeg.js';
+import { discordCache } from './discord-cache.js';
 
 let web = null, tunnel = null, watchTogether;
 console.log(`[entity] release=${RELEASE} memoryProfile=${resources.compact ? 'compact' : 'standard'}`);
@@ -40,6 +39,7 @@ const env = {
 const guildId = process.env.DISCORD_GUILD_ID || undefined;
 
 const client = new Client({
+  makeCache: discordCache(resources.compact),
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
@@ -69,8 +69,7 @@ watchTogether = registerWatchTogether(client, {
   }
 });
 registerRadio(client, { isQuizActive: id => hasSession(id) || watchTogether.isActive(id) || Boolean(web?.isWatchingGuild(id)) });
-const dataDir = resolve(dirname(fileURLToPath(import.meta.url)), '../data/binance');
-const binance = registerBinance(client, { dataDir });
+registerHelp(client);
 process.once('exit', () => tunnel?.close());
 registerWebCommands(client, { getWeb: () => web, isRadioActive: isOtherPlaybackActive, publishEntry });
 if (process.env.WEB_ENABLED !== '0') {
@@ -94,15 +93,12 @@ quizEvents.on('start', session => {
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`통합 봇 로그인: ${readyClient.user.tag} · 서버 ${readyClient.guilds.cache.size}개`);
+  readyClient.user.setPresence({ activities: [] });
   try {
     const result = await syncSlashCommands(client.application.commands, { guildIds: readyClient.guilds.cache.keys(), primaryGuildId: guildId });
     console.log(`슬래시 명령 등록 완료 · 중복·이전 명령 ${result.removed}개 정리`);
   } catch (error) { console.error('슬래시 명령 등록 실패:', error); }
 
-  for (const [, guild] of readyClient.guilds.cache) {
-    try { await guild.members.fetch(); }
-    catch (error) { console.warn(`${guild.name}: 멤버 정보 로드 실패:`, error.message); }
-  }
 });
 
 client.on(Events.GuildCreate, guild => {
@@ -133,7 +129,6 @@ async function shutdown() {
   tunnel?.close();
   await web?.close();
   await entryPanels.close();
-  await Promise.race([binance.close(), new Promise(resolve => setTimeout(resolve, 5000))]);
   client.destroy();
   process.exit(0);
 }
@@ -144,7 +139,6 @@ client.login(env.DISCORD_TOKEN).catch(error => {
   console.error('디스코드 로그인 실패:', error);
   process.exitCode = 1;
   stopMemoryMonitor();
-  binance.close().catch(() => {});
   tunnel?.close();
   web?.close().catch(() => {});
 });

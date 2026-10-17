@@ -1,13 +1,14 @@
 // Bounded, shared preparation queue. Foreground requests outrank speculative work.
 export class ClipCache {
   constructor(load, { concurrency = 2, maxBytes = 16 * 1024 * 1024,
-    maxEntries = 64, ttlMs = 15 * 60_000, failureTtlMs = 30_000, now = Date.now } = {}) {
+    maxEntries = 64, ttlMs = 15 * 60_000, failureTtlMs = 30_000, now = Date.now, autoPrune = now === Date.now } = {}) {
     Object.assign(this, { load, concurrency, maxBytes, maxEntries, ttlMs, failureTtlMs, now })
     this.entries = new Map()
     this.jobs = new Map()
     this.queue = []
     this.active = 0
     this.bytes = 0
+    this.autoPrune = autoPrune
   }
 
   get(key, options, { signal, priority = false } = {}) {
@@ -53,9 +54,21 @@ export class ClipCache {
         this.entries.delete(key)
       }
     }
+    this.schedulePrune()
   }
 
-  clear() { this.entries.clear(); this.bytes = 0 }
+  schedulePrune() {
+    if (!this.autoPrune) return
+    const deadline = Math.min(...[...this.entries.values()].map(entry => entry.expiresAt))
+    if (deadline === this.pruneDeadline) return
+    clearTimeout(this.pruneTimer); this.pruneDeadline = deadline
+    if (Number.isFinite(deadline)) {
+      this.pruneTimer = setTimeout(() => { this.pruneDeadline = null; this.prune() }, Math.max(1, deadline - this.now()))
+      this.pruneTimer.unref()
+    }
+  }
+
+  clear() { clearTimeout(this.pruneTimer); this.pruneDeadline = null; this.entries.clear(); this.bytes = 0 }
 
   store(job, value, error) {
     const bytes = value?.bytes ?? 0
@@ -69,6 +82,7 @@ export class ClipCache {
       this.bytes -= this.entries.get(oldest).bytes
       this.entries.delete(oldest)
     }
+    this.schedulePrune()
   }
 
   pump() {

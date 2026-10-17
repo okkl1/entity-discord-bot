@@ -1,12 +1,14 @@
 import { radioCommands } from './chzzk/commands.js';
-import { binanceCommands } from './binance/plugin.js';
+import { helpCommands } from './help.js';
 import { webCommands } from './web/commands.js';
 import { watchTogetherCommands } from './web/watch-together.js';
 
-export const sharedCommands = [...radioCommands, ...binanceCommands];
+export const sharedCommands = [...radioCommands, ...helpCommands];
 export const roomCommands = [...webCommands, ...watchTogetherCommands];
 export const allCommands = [...sharedCommands, ...roomCommands];
-const managedNames = new Set([...allCommands.map(command => command.name), 'watch', 'stop']);
+// Retired commands stay managed so existing global/guild registrations are
+// removed after the current commands have been registered successfully.
+const managedNames = new Set([...allCommands.map(command => command.name), 'watch', 'stop', 'price', 'symbol']);
 
 async function removeObsolete(manager, desired, guildId) {
   const keep = new Set(desired.map(command => command.name));

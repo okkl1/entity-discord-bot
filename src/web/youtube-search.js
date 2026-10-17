@@ -2,8 +2,11 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveYtDlpPath } from '../machugi/yt-dlp-path.js';
 import { ytDlpOptions, youtubeFailure } from '../machugi/yt-dlp-options.js';
-const run = (file, args, { onEntry, ...options }) => new Promise((resolve, reject) => {
-  const child = execFile(file, args, options, (error, stdout) => error ? reject(error) : resolve({ stdout }));
+import { runExtraction } from '../media-resources.js';
+const run = (file, args, { onEntry, ...options }) => runExtraction(() => {
+  let child;
+  const pending = new Promise((resolve, reject) => {
+  child = execFile(file, args, options, (error, stdout) => error ? reject(error) : resolve({ stdout }));
   let remaining = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', chunk => {
@@ -14,7 +17,9 @@ const run = (file, args, { onEntry, ...options }) => new Promise((resolve, rejec
       try { onEntry?.(JSON.parse(line)); } catch {}
     }
   });
-});
+  });
+  pending.child = child; return pending;
+}, { signal: options.signal });
 const publicVideo = (v, direct) => ({
   id: v.id, title: String(v.title || '제목 없는 영상').slice(0, 200), channel: String(v.channel || v.uploader || '').slice(0, 100),
   artist: typeof v.artist === 'string' ? v.artist.slice(0, 100) : undefined, track: typeof v.track === 'string' ? v.track.slice(0, 200) : undefined,

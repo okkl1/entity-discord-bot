@@ -45,8 +45,28 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
   executable = process.env.SLSKD_EXECUTABLE || (process.platform === 'win32'
     ? fileURLToPath(new URL('../../bin/slskd/slskd.exe', import.meta.url)) : '/opt/slskd/slskd'),
   noConnect = false, credentials = process.env } = {}) {
-  let starting, child, client, stopping = false, exitHandler;
+  let starting, child, client, stopping = false, exitHandler, suspending;
+  const plannedStops = new WeakSet();
   const cacheRoot = join(root, 'cache');
+  async function stopChild() {
+    client?.close(); client = null;
+    const launched = child; child = null;
+    if (launched && launched.exitCode === null && launched.signalCode === null) {
+      plannedStops.add(launched);
+      await new Promise((resolve, reject) => {
+        let timer;
+        const done = () => { clearTimeout(timer); resolve(); };
+        launched.once('close', done);
+        timer = setTimeout(() => {
+          launched.kill('SIGKILL');
+          timer = setTimeout(() => { launched.off('close', done); reject(new Error('Soulseek 연결 프로그램 종료가 지연되고 있습니다.')); }, 1000);
+        }, 4000);
+        launched.kill();
+      });
+    }
+    if (exitHandler) { process.removeListener('exit', exitHandler); exitHandler = null; }
+    await writeFile(join(root, 'slskd', 'slskd.yml'), '{}').catch(() => {});
+  }
   async function settings() {
     // Northflank runtime variables never enter the git repository or image layers.
     // On Windows, the original local DPAPI settings file remains supported.
@@ -63,6 +83,7 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
   return { cacheRoot,
     async configured() { const value = await settings(); return Boolean(value?.username && (value?.password || value?.passwordProtected)); },
     async start() {
+      if (suspending) await suspending;
       if (stopping) throw new Error('Soulseek 연결 프로그램을 종료하고 있습니다.');
       if (client) return client;
       if (starting) return starting;
@@ -107,7 +128,7 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
         const untrack = trackMemoryProcess('soulseek', launched.pid);
         launched.once('exit', (code, signal) => {
           untrack();
-          if (!stopping) console.warn(`[soulseek] process exited: code=${code}, signal=${signal || 'none'}`);
+          if (!stopping && !plannedStops.has(launched)) console.warn(`[soulseek] process exited: code=${code}, signal=${signal || 'none'}`);
         });
         console.log(`[soulseek] native=${process.env.ENTITY_SLSKD_BUILD || 'external'} memoryProfile=${resources.compact ? 'compact' : 'standard'}`);
         exitHandler = () => { launched.kill(); try { writeFileSync(configPath, '{}'); } catch {} };
@@ -120,7 +141,7 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
         });
         const candidate = new SoulseekClient({ baseUrl: `http://127.0.0.1:${port}`, apiKey, loginFailure: () => loginFailureSince(logPath, logOffset) });
         for (let i = 0; i < 60; i++) {
-          if (stopping || launchError || launched.exitCode !== null) break;
+          if (stopping || launchError || launched.exitCode !== null || launched.signalCode !== null) break;
           try { await candidate.request('/application', { timeoutMs: 1000 }); client = candidate; return client; } catch {}
           await delay(500);
         }
@@ -131,14 +152,11 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
       })();
       try { return await starting; } finally { starting = null; }
     },
-    async close() {
-      stopping = true; await starting?.catch(() => {}); client?.close(); client = null;
-      if (child) {
-        const process = child; child = null;
-        if (process.exitCode === null) { process.kill(); await Promise.race([new Promise(resolve => process.once('exit', resolve)), delay(4000)]); }
-      }
-      if (exitHandler) { process.removeListener('exit', exitHandler); exitHandler = null; }
-      await writeFile(join(root, 'slskd', 'slskd.yml'), '{}').catch(() => {});
+    async suspend() {
+      if (stopping) return;
+      if (!suspending) suspending = (async () => { await starting?.catch(() => {}); await stopChild(); console.log('[soulseek] idle: stopped unused native process'); })();
+      try { await suspending; } finally { suspending = null; }
     },
+    async close() { stopping = true; await suspending?.catch(() => {}); await starting?.catch(() => {}); await stopChild(); },
   };
 }

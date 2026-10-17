@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-export const RELEASE = '2026-10-16-v4';
+export const RELEASE = '2026-10-17-v5.1';
 
 export function resourceSettings(env = process.env) {
   const compact = env.ENTITY_MEMORY_PROFILE === 'compact';
@@ -9,4 +9,6 @@ export function resourceSettings(env = process.env) {
 export const resources = resourceSettings();
 const pressure = new EventEmitter(); pressure.setMaxListeners(0);
 export function onMemoryPressure(callback) { pressure.on('pressure', callback); return () => pressure.off('pressure', callback); }
-export function releaseIdleMemory() { pressure.emit('pressure'); }
+let backgroundPausedUntil = 0;
+export const backgroundWorkAllowed = () => Date.now() >= backgroundPausedUntil;
+export function releaseIdleMemory() { backgroundPausedUntil = Date.now() + 30_000; pressure.emit('pressure'); }

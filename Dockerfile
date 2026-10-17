@@ -36,7 +36,7 @@ COPY bin/slskd/slskd-source.zip bin/slskd/LICENSE bin/slskd/SOURCE.md ./bin/slsk
 RUN test -x /opt/slskd/slskd \
     && /usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i sine=duration=0.1 \
        -c:a libopus -f null - \
-    && mkdir -p data/binance data/machugi data/lossless data/chzzk /tmp/dotnet-bundle \
+    && mkdir -p data/machugi data/lossless data/chzzk /tmp/dotnet-bundle \
     && chown -R node:node /app /tmp/dotnet-bundle
 ENV NODE_ENV=production \
     ENTITY_MEMORY_PROFILE=compact \
