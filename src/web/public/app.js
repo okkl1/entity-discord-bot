@@ -72,7 +72,7 @@ const resumeSet = value => { try { sessionStorage.setItem(resumeKey, value); } c
 const notify = text => { $('notice').textContent = text; $('notice').hidden = false; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { $('notice').hidden = true; }, 4500); };
 const send = data => { if (socket?.readyState !== WebSocket.OPEN || !joined) { notify('방 연결을 기다려주세요.'); return false; } socket.send(JSON.stringify(data)); return true; };
 const now = () => Date.now() + offset;
-const losslessPlayer = createLosslessPlayer($('lossless-audio'), { now, onNotice: notify, onEnded: data => { if (joined) send({ type: 'audioEnded', ...data }); }, onStatus: value => {
+const losslessPlayer = createLosslessPlayer($('lossless-audio'), { preloadAudio: $('lossless-next-audio'), now, onNotice: notify, onEnded: data => { if (joined) send({ type: 'audioEnded', ...data }); }, onStatus: value => {
   $('audio-enable').textContent = value.blocked || !value.enabled ? '이 기기에서 소리 켜기' : '이 기기 소리 끄기';
   $('audio-enable').dataset.enabled = String(value.enabled && !value.blocked);
   $('audio-buffer').textContent = value.buffering ? state?.audio?.status === 'verifying' ? '음원 손상 여부를 확인하고 있어요 · 확인 후 자동 재생' : '끊김을 줄이기 위해 음원을 준비하고 있어요 · 준비되면 자동 재생' : state?.audio?.integrity === 'verified' ? '원본 무결성 확인 · FLAC 원본 재생' : state?.audio?.integrity === 'pending' ? 'FLAC 원본 재생 · 전체 검사 중' : '디코딩 확인 · FLAC 원본 재생';
@@ -539,7 +539,7 @@ $('track-search-form').onsubmit = event => { event.preventDefault(); searchTrack
 $('next-track').onclick = () => send({ type: 'next', phase: state?.phase, roundId: state?.roundId });
 $('queue-clear').onclick = () => { if (matchingAction === 'queue') matchController?.abort(); send({ type: 'queueClear' }); };
 $('audio-enable').onclick = () => $('audio-enable').dataset.enabled === 'true' ? losslessPlayer.mute() : losslessPlayer.enable();
-$('audio-volume').oninput = () => { $('lossless-audio').volume = Number($('audio-volume').value); };
+$('audio-volume').oninput = () => losslessPlayer.setVolume(Number($('audio-volume').value));
 $('seek-form').onsubmit = event => { event.preventDefault(); send({ type: state?.phase === 'listen' ? 'audioSeek' : 'watchSeek', seconds: Number($('seek-seconds').value), roundId: state?.roundId, phase: state?.phase }); };
 $('sync-watch').onclick = () => { if (state?.phase === 'listen') { losslessPlayer.sync(); notify('방의 재생 위치에 맞췄어요.'); return; } if (!playerReady || !state?.video) return; player.seekTo(videoPosition(), true); if (!state.paused) player.playVideo(); notify('방의 재생 위치에 맞췄어요.'); };
 $('answer-form').onsubmit = event => {

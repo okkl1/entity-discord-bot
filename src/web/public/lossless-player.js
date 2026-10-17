@@ -1,6 +1,7 @@
 // Play the original FLAC bytes. Synchronization seeks; it never changes speed.
-export function createLosslessPlayer(audio, { now = Date.now, onNotice = () => {}, onStatus = () => {}, onEnded = () => {} } = {}) {
+export function createLosslessPlayer(audio, { preloadAudio = null, now = Date.now, onNotice = () => {}, onStatus = () => {}, onEnded = () => {} } = {}) {
   let state, key = '', enabled = false, blocked = false, startTimer, alignPending = false, initialAlign = false, hasPlayed = false, alignTolerance = 0.25, lastSeekAt = -Infinity, playRequest, holdingBuffer = false;
+  let warm = preloadAudio, warmKey = '', warmUrl = '', warmLoaded = false, warmTimer;
   const position = () => !state?.audio?.startedAt ? 0 : state.audio.startSeconds + Math.max(0,
     ((state.paused ? state.audio.pausedAt : now()) - state.audio.startedAt) / 1000);
   const status = () => onStatus({ enabled, blocked, buffering: Boolean(key && (holdingBuffer || audio.readyState < 3 || !state.audio.startedAt || state.buffering)) });
@@ -10,6 +11,29 @@ export function createLosslessPlayer(audio, { now = Date.now, onNotice = () => {
       if (target >= audio.buffered.start(i) && audio.buffered.end(i) >= target + Math.min(seconds, Math.max(0, duration - target))) return true;
     }
     return false;
+  };
+  const clearWarm = () => {
+    clearTimeout(warmTimer);
+    if (warmLoaded) { warm.pause(); warm.removeAttribute('src'); warm.load(); }
+    warmKey = ''; warmUrl = ''; warmLoaded = false;
+  };
+  const prepareNext = () => {
+    clearTimeout(warmTimer);
+    if (!warm) return;
+    // Queue ownership is being transferred during this brief loading phase.
+    // Keep the already-buffered successor until its actual playback state.
+    if (state?.phase === 'loading' && warmKey) return;
+    const next = state?.phase === 'listen' && state.nextAudio?.id !== key ? state.nextAudio : null;
+    if (!next) { clearWarm(); return; }
+    if (warmKey !== next.id || warmUrl !== next.url) { clearWarm(); warmKey = next.id; warmUrl = next.url; }
+    if (warmLoaded || !enabled || state.paused || state.buffering || !state.audio.startedAt) return;
+    const duration = state.audio.duration || audio.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    const remaining = duration - position();
+    if (remaining > 30) {
+      warmTimer = setTimeout(prepareNext, Math.min(2_147_483_647, (remaining - 30) * 1000)); return;
+    }
+    warm.volume = audio.volume; warm.preload = 'auto'; warm.src = warmUrl; warm.load(); warmLoaded = true;
   };
   const play = () => {
     if (playRequest || blocked) return;
@@ -51,17 +75,17 @@ export function createLosslessPlayer(audio, { now = Date.now, onNotice = () => {
     if (audio.paused) play();
     status();
   };
-  audio.addEventListener('canplay', () => sync());
-  audio.addEventListener('loadeddata', () => sync());
-  audio.addEventListener('waiting', () => {
-    if (key && enabled && !state.paused) { holdingBuffer = true; audio.pause(); }
-    status();
-  });
-  audio.addEventListener('progress', () => sync());
-  audio.addEventListener('seeked', () => sync());
-  audio.addEventListener('playing', () => { hasPlayed = true; status(); });
-  audio.addEventListener('ended', () => { if (key && !state.paused) onEnded({ roundId: state.roundId, phase: 'listen' }); });
-  audio.addEventListener('error', () => { if (key) { blocked = true; status(); onNotice('음원을 재생하지 못했습니다. FLAC를 지원하는 최신 브라우저에서 다시 참가해주세요.'); } });
+  for (const element of [audio, warm].filter(Boolean)) {
+    for (const event of ['canplay', 'loadeddata', 'progress', 'seeked']) element.addEventListener(event, () => { if (element === audio) sync(); });
+    element.addEventListener('waiting', () => {
+      if (element !== audio) return;
+      if (key && enabled && !state.paused) { holdingBuffer = true; audio.pause(); }
+      status();
+    });
+    element.addEventListener('playing', () => { if (element === audio) { hasPlayed = true; status(); } });
+    element.addEventListener('ended', () => { if (element === audio && key && !state.paused) onEnded({ roundId: state.roundId, phase: 'listen' }); });
+    element.addEventListener('error', () => { if (element === audio && key) { blocked = true; status(); onNotice('음원을 재생하지 못했습니다. FLAC를 지원하는 최신 브라우저에서 다시 참가해주세요.'); } });
+  }
   return {
     update(next) {
       if (next.audio && state?.audio && (next.audio.startedAt !== state.audio.startedAt || next.audio.startSeconds !== state.audio.startSeconds)) {
@@ -72,19 +96,25 @@ export function createLosslessPlayer(audio, { now = Date.now, onNotice = () => {
       const nextKey = next.phase === 'listen' && next.audio ? next.audio.id : '';
       if (nextKey !== key) {
         audio.pause(); blocked = false; key = nextKey; alignPending = Boolean(key); initialAlign = true; hasPlayed = false; alignTolerance = 0.25; lastSeekAt = -Infinity; playRequest = null; holdingBuffer = Boolean(key);
-        if (key) { audio.src = next.audio.url; audio.load(); }
+        if (key && warmLoaded && warmKey === key && !warm.error) {
+          const previous = audio; audio = warm; warm = previous;
+          warm.pause(); warm.removeAttribute('src'); warm.load();
+          clearTimeout(warmTimer); warmKey = ''; warmUrl = ''; warmLoaded = false;
+        }
+        else if (key) { audio.src = next.audio.url; audio.load(); }
         else { audio.removeAttribute('src'); audio.load(); }
       }
-      sync();
+      sync(); prepareNext();
     },
     enable() {
       enabled = true; blocked = false;
       // Called directly by the user's click so browsers can grant sound access.
       if (key) sync();
-      status();
+      prepareNext(); status();
     },
-    mute() { enabled = false; audio.pause(); status(); },
-    pause() { clearTimeout(startTimer); audio.pause(); },
+    mute() { enabled = false; audio.pause(); clearWarm(); status(); },
+    pause() { clearTimeout(startTimer); audio.pause(); clearWarm(); },
+    setVolume(value) { if (!Number.isFinite(value)) return; audio.volume = Math.max(0, Math.min(1, value)); if (warm) warm.volume = audio.volume; },
     sync: () => sync(true), position,
   };
 }
