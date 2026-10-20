@@ -13,6 +13,7 @@ import { searchMusicTracks } from './music-search.js';
 import { searchMusicAlbums, publicAlbum, publicTrack } from './album-search.js';
 import { createMusicIdentityLookup, readVideoMusicMetadata } from './music-identity.js';
 import { resources, RELEASE } from '../resource-profile.js';
+import { touchSocket, heartbeatSocket } from './socket-heartbeat.js';
 
 const secret = () => randomBytes(24).toString('base64url');
 const sameSecret = (a, b) => typeof a === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -22,9 +23,11 @@ const assets = new Map([['/', ['index.html', 'text/html; charset=utf-8']],
   ['/api-response.js', ['api-response.js', 'text/javascript; charset=utf-8']],
   ['/track-search-response.js', ['track-search-response.js', 'text/javascript; charset=utf-8']],
   ['/lossless-player.js', ['lossless-player.js', 'text/javascript; charset=utf-8']],
+  ['/room-connection.js', ['room-connection.js', 'text/javascript; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']], ['/style.css', ['style.css', 'text/css; charset=utf-8']]]);
 
 export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, isRadioActive = () => false,
+  runtimeStatus = () => ({}),
   busy = hasSession, launch = startQuizSession, events = quizEvents,
   search = options => searchMusicQuizzes(options),
   videoSearch = createYouTubeSearch(),
@@ -42,6 +45,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     return { quiz: { id: detail.id, title: detail.title, thumbnail_url: detail.thumbnailUrl }, questions: valid };
   }, publicUrl = '' } = {}) {
   const rooms = new Map(), guildRooms = new Map(), httpLimits = new Map();
+  const startedAt = new Date().toISOString(), startedTime = performance.now(), instance = randomBytes(8).toString('hex');
   let baseUrl = publicUrl.replace(/\/$/, '');
   if (baseUrl) {
     const parsed = new URL(baseUrl);
@@ -53,7 +57,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     if (ws.readyState !== WebSocket.OPEN) return;
     const isState = replaceable || data?.type === 'state';
     const payload = typeof data === 'string' ? data : JSON.stringify(data);
-    if (ws.bufferedAmount > 256 * 1024 + (ws.stateBytes || 0)) { ws.close(1013, 'Connection too slow'); return; }
+    if (ws.bufferedAmount > 256 * 1024 + (ws.stateBytes || 0)) { ws.disconnectCause = 'backpressure'; ws.close(1013, 'Connection too slow'); return; }
     const bytes = isState ? Buffer.byteLength(payload) : 0;
     // Preserve ordinary small transition/retry notices exactly as before.
     if (!isState || (!ws.stateInFlight && bytes < 64 * 1024)) { ws.send(payload); return; }
@@ -427,7 +431,12 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         await readFile(new URL('../../bin/slskd/slskd-source.zip', import.meta.url)), 'application/zip');
       if (url.pathname === '/opensource/slskd-license.txt') return reply(200,
         await readFile(new URL('../../bin/slskd/LICENSE', import.meta.url)), 'text/plain; charset=utf-8');
-      if (url.pathname === '/api/health') return reply(200, { ok: true, release: RELEASE, memoryProfile: resources.compact ? 'compact' : 'standard' });
+      if (url.pathname === '/api/health') {
+        const ready = runtimeStatus().discordReady;
+        return reply(200, { ok: true, release: RELEASE, memoryProfile: resources.compact ? 'compact' : 'standard',
+          instance, startedAt, uptimeSeconds: Math.floor((performance.now() - startedTime) / 1000),
+          discordReady: typeof ready === 'boolean' ? ready : null });
+      }
       const roomRoute = /^\/api\/rooms\/([\w-]+)(\/(?:quizzes|videos|tracks|albums))?$/.exec(url.pathname);
       if (roomRoute) {
         const room = rooms.get(roomRoute[1]);
@@ -590,11 +599,12 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
   wss.on('connection', ws => {
     const room = ws.room;
     let player, since = Date.now(), commands = 0;
-    ws.alive = true;
-    ws.on('pong', () => { ws.alive = true; });
-    const joinTimer = setTimeout(() => ws.close(1008, 'Join required'), 10_000);
+    touchSocket(ws);
+    ws.on('pong', () => touchSocket(ws));
+    const joinTimer = setTimeout(() => { ws.disconnectCause = 'join-timeout'; ws.close(1013, 'Join timed out'); }, 30_000);
     ws.on('error', () => {});
     ws.on('message', async raw => {
+      touchSocket(ws);
       try {
         if (Date.now() - since > 1000) { since = Date.now(); commands = 0; }
         if (++commands > 12) throw new Error('입력이 너무 빠릅니다. 잠시 기다려주세요.');
@@ -793,12 +803,15 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         if (error.code === 'DISCORD_JOIN_REQUIRED') ws.close(1008, 'Discord entry required');
       }
     });
-    ws.on('close', () => { clearTimeout(joinTimer); ws.pendingState = null; room.clients.delete(ws); room.touchedAt = Date.now(); presence(room); });
+    ws.on('close', code => {
+      clearTimeout(joinTimer); ws.pendingState = null; room.clients.delete(ws); room.touchedAt = Date.now(); presence(room);
+      if (![1000, 1001, 1005].includes(code)) console.warn(`[web] socket closed: code=${code} cause=${ws.disconnectCause || (code === 1008 ? 'entry-required' : 'transport')} uptimeSeconds=${Math.floor((performance.now() - startedTime) / 1000)}`);
+    });
   });
 
   const heartbeat = setInterval(() => {
-    for (const ws of wss.clients) { if (!ws.alive) ws.terminate(); else { ws.alive = false; ws.ping(); } }
-    for (const room of rooms.values()) if ((room.audioTrack || room.watch || room.advancing || room.queue.size) && !room.clients.size && Date.now() - room.touchedAt > 30_000) {
+    for (const ws of wss.clients) heartbeatSocket(ws);
+    for (const room of rooms.values()) if ((room.audioTrack || room.watch || room.advancing || room.queue.size) && !room.clients.size && Date.now() - room.touchedAt > 90_000) {
       room.cancelStart = true; room.startJob = null; room.starting = false;
       if (room.audioTrack) endAudio(room); else endWatch(room);
     }

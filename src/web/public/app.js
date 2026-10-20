@@ -2,6 +2,7 @@ import { protectComposition } from './input-guard.js';
 import { createLosslessPlayer } from './lossless-player.js';
 import { readApiResponse } from './api-response.js';
 import { readTrackSearchResponse } from './track-search-response.js';
+import { createRoomConnection } from './room-connection.js';
 
 const $ = id => document.getElementById(id);
 for (const form of document.querySelectorAll('form')) protectComposition(form);
@@ -20,7 +21,7 @@ try {
 // Keep the private host token out of URLs passed to embedded video players.
 if (providedHostToken || providedJoinToken) history.replaceState(null, '', location.pathname + location.search);
 let socket, joined = false, host = false, state, revision = -1, offset = 0, bestRtt = Infinity;
-let player, playerReady = false, videoKey = '', noticeTimer, reconnectTimer, searchController;
+let player, playerReady = false, videoKey = '', noticeTimer, searchController;
 let videoSoundEnabled = true, videoAutoplayBlocked = false, videoWasPaused = false;
 let youtubeController, trackController, matchController, matchingAction, matchingSource;
 let pendingPause;
@@ -233,16 +234,45 @@ function prepareVideo() {
   };
   const script = document.createElement('script'); script.src = 'https://www.youtube.com/iframe_api'; script.onerror = () => notify('유튜브 연결을 확인해주세요. 정답 입력은 계속 사용할 수 있어요.'); document.head.append(script);
 }
-function connect() {
-  clearTimeout(reconnectTimer);
-  if (socket) { const old = socket; socket = null; old.close(); }
-  $('connection').textContent = '방에 연결 중'; $('connection').className = 'connection';
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/socket?room=${encodeURIComponent(roomId)}`);
-  socket = ws;
-  ws.onopen = () => { if (socket === ws) ws.send(JSON.stringify({ type: 'join', name: $('nickname').value.trim(), joinToken, hostToken, resumeToken: resumeGet() })); };
-  ws.onmessage = event => {
-    if (socket !== ws) return;
-    const msg = JSON.parse(event.data);
+const connection = createRoomConnection({
+  url: () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/socket?room=${encodeURIComponent(roomId)}`,
+  join: () => ({ name: $('nickname').value.trim(), joinToken, hostToken, resumeToken: resumeGet() }),
+  online: () => navigator.onLine !== false,
+  checkRoom: async ({ signal }) => {
+    const response = await fetch(`/api/rooms/${roomId}`, { signal, cache: 'no-store' });
+    await response.body?.cancel();
+    return response.status;
+  },
+  onSocket: ws => { socket = ws; },
+  onStatus: ({ type, attempts, delay, code, reason }) => {
+    const labels = {
+      connecting: '방에 연결 중', connected: '실시간 연결됨',
+      retrying: `연결 복구 중 · ${Math.ceil((delay || 1000) / 1000)}초 후 재시도`,
+      offline: '인터넷 연결을 기다리는 중', missing: '방이 종료됨 · 디스코드에서 다시 입장',
+      expired: '디스코드에서 다시 참가해주세요.', replaced: '다른 창에서 접속 중'
+    };
+    $('connection').textContent = labels[type] || '연결 확인 중';
+    $('connection').className = `connection${type === 'connected' ? ' online' : type === 'connecting' ? '' : ' offline'}`;
+    if (type === 'retrying') {
+      // No room URL, identity or credential is written to the console.
+      console.warn('[connection]', { attempts, code, reason });
+      if (attempts === 3) notify('서버 연결이 지연되고 있습니다. 자동으로 다시 연결합니다.');
+    }
+    if (type === 'replaced') notify('다른 창에서 이 방에 접속했습니다.');
+    if (type === 'expired' || type === 'missing') {
+      $('game').hidden = true; $('join-card').hidden = false; $('discord-join').hidden = false;
+      $('join-form').hidden = true;
+      $('discord-join-hint').textContent = type === 'missing'
+        ? '방이 종료되었거나 서버가 재시작되었습니다. 디스코드에서 /웹방으로 다시 입장해주세요.'
+        : '입장 정보가 만료됐습니다. 봇을 호출한 디스코드 채팅의 「웹방 입장」 버튼을 다시 누르세요.';
+    }
+  },
+  onDisconnect: () => {
+    clearPendingPause(); joined = false;
+    player?.mute(); losslessPlayer.pause();
+    if (state) applyState(state);
+  },
+  onMessage: (msg, ws) => {
     if (msg.type === 'joined') {
       updateEntryChannel(msg.discordChannelUrl);
       joined = true; host = msg.host; revision = -1; bestRtt = Infinity; losslessPrepared = false; resumeSet(msg.resumeToken); storageSet('entity-nickname', msg.name);
@@ -250,7 +280,6 @@ function connect() {
       $('join-card').hidden = true; $('game').hidden = false; $('host-controls').hidden = false;
       $('connection').textContent = '실시간 연결됨'; $('connection').className = 'connection online';
       selectMode(mode);
-      ws.send(JSON.stringify({ type: 'ping', sentAt: Date.now() }));
     } else if (msg.type === 'entryChannel') updateEntryChannel(msg.discordChannelUrl);
     else if (msg.type === 'hostRole') { host = msg.host; if (state) applyState(state); }
     else if (msg.type === 'state') { if (bestRtt === Infinity) offset = msg.serverTime - Date.now(); applyState(msg); }
@@ -267,25 +296,9 @@ function connect() {
     } else if (msg.type === 'queueAck') notify(`${msg.title} · 다음 곡으로 예약했어요.`);
     else if (msg.type === 'albumQueueAck') notify(`${msg.title} · ${msg.added}곡 예약${msg.skipped ? ` · 중복 ${msg.skipped}곡 제외` : ''}`);
     else if (msg.type === 'error') { clearPendingPause(); notify(msg.message); if (state) applyState(state); }
-  };
-  ws.onclose = event => {
-    if (socket !== ws) return;
-    clearPendingPause();
-    joined = false; $('connection').textContent = '연결 끊김 · 재접속 중'; $('connection').className = 'connection offline';
-    player?.mute();
-    losslessPlayer.pause();
-    if (state) applyState(state);
-    if (event.code === 1000) { notify('다른 창에서 이 방에 접속했습니다.'); return; }
-    if (event.code === 1008) {
-      $('connection').textContent = '디스코드에서 다시 참가해주세요.';
-      $('game').hidden = true; $('join-card').hidden = false; $('discord-join').hidden = false;
-      $('discord-join-hint').textContent = '입장 정보가 만료됐습니다. 봇을 호출한 디스코드 채팅의 「웹방 입장」 버튼을 다시 누르세요.';
-      return;
-    }
-    reconnectTimer = setTimeout(connect, 2000);
-  };
-  ws.onerror = () => {};
-}
+  }
+});
+function connect() { connection.connect(); }
 async function searchQuizzes() {
   searchedQuizzes = true;
   searchController?.abort(); searchController = new AbortController();
@@ -585,12 +598,14 @@ window.addEventListener('keydown', event => {
   control('skip');
 }, { capture: true });
 setInterval(() => { if (!document.hidden) updateTimer(); }, 250); setInterval(() => { syncVideo(); if (joined && state?.phase === 'listen') losslessPlayer.update(localPlaybackState(state)); }, 2000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { syncVideo(); updateTimer(); } });
-window.addEventListener('pagehide', () => { player?.mute(); losslessPlayer.pause(); socket?.close(); });
-setInterval(() => { if (joined && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping', sentAt: Date.now() })); }, 10_000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { connection.wake(); syncVideo(); updateTimer(); } });
+window.addEventListener('online', () => connection.wake());
+window.addEventListener('offline', () => connection.wake());
+window.addEventListener('pagehide', () => { player?.mute(); losslessPlayer.pause(); connection.stop(); });
+window.addEventListener('pageshow', event => { if (event.persisted && roomId) connect(); });
 if (roomId) {
   $('intro').hidden = true; $('join-card').hidden = false; $('nickname').value = storageGet('entity-nickname');
-  fetch(`/api/rooms/${roomId}`).then(async response => {
+  fetch(`/api/rooms/${roomId}`, { signal: AbortSignal.timeout(15_000), cache: 'no-store' }).then(async response => {
     const data = await readApiResponse(response);
     $('room-voice').textContent = `${data.voiceName} · 퀴즈·음악·유튜브를 함께 즐기는 방`;
     requireDiscordIdentity = Boolean(data.requireDiscordIdentity); updateEntryChannel(data.discordChannelUrl || '');
@@ -604,7 +619,9 @@ if (roomId) {
     if (!losslessConfigured) $('lossless-hint').textContent = '먼저 PC의 엔티티 폴더에서 「무손실음악 설정.cmd」를 실행해주세요.';
     if (requireDiscordIdentity ? joinToken : $('nickname').value.trim()) connect();
   }).catch(error => {
-    notify(error.message); $('join-form').querySelector('button').disabled = true;
-    $('discord-join').hidden = false; $('discord-join-hint').textContent = error.message;
+    const message = error.name === 'TimeoutError' ? '서버 응답이 지연됩니다. 잠시 후 새로 고치거나 디스코드에서 다시 입장해주세요.' : error.message;
+    $('connection').textContent = '방 연결 확인 실패'; $('connection').className = 'connection offline';
+    notify(message); $('join-form').querySelector('button').disabled = true;
+    $('discord-join').hidden = false; $('discord-join-hint').textContent = message;
   });
 } else { $('connection').textContent = '디스코드에서 퀴즈 시작'; }
