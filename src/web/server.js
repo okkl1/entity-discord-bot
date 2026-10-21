@@ -10,9 +10,10 @@ import { createPlaybackQueue } from './playback-queue.js';
 import { createPeerFallback } from './peer-fallback.js';
 import { searchMatchedTracks, songFromVideo, matchTracks } from './track-match.js';
 import { searchMusicTracks } from './music-search.js';
+import { parseBatchQueries, findBatchTrack, runBatchMusic } from './batch-music.js';
 import { searchMusicAlbums, publicAlbum, publicTrack } from './album-search.js';
 import { createMusicIdentityLookup, readVideoMusicMetadata } from './music-identity.js';
-import { resources, RELEASE } from '../resource-profile.js';
+import { resources, RELEASE, onMemoryPressure, memoryWorkAllowed } from '../resource-profile.js';
 import { touchSocket, heartbeatSocket } from './socket-heartbeat.js';
 
 const secret = () => randomBytes(24).toString('base64url');
@@ -45,6 +46,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     return { quiz: { id: detail.id, title: detail.title, thumbnail_url: detail.thumbnailUrl }, questions: valid };
   }, publicUrl = '' } = {}) {
   const rooms = new Map(), guildRooms = new Map(), httpLimits = new Map();
+  const offPressure = onMemoryPressure(() => { if (resources.compact) for (const room of rooms.values()) room.queue?.defer(); });
   const startedAt = new Date().toISOString(), startedTime = performance.now(), instance = randomBytes(8).toString('hex');
   let baseUrl = publicUrl.replace(/\/$/, '');
   if (baseUrl) {
@@ -109,7 +111,8 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     if (publish) state(room, room.state);
   };
   const clearWatch = room => { cancelHandoff(room, false); clearTimeout(room.watchTimer); room.watchTimer = null; room.watch = false; room.watchPick = null; };
-  const clearQueue = room => { room.queueEpoch++; room.transitionAudio = null; room.queueSearchController?.abort(); room.queueSearchController = null; return room.queue?.clear(); };
+  const cancelBatch = room => { room.batchJob?.controller.abort(); };
+  const clearQueue = room => { cancelBatch(room); clearTimeout(room.memoryRetryTimer); room.memoryRetryTimer = null; room.queueEpoch++; room.transitionAudio = null; room.queueSearchController?.abort(); room.queueSearchController = null; return room.queue?.clear(); };
   const clearAudio = async room => {
     clearTimeout(room.audioTimer); room.audioTimer = null;
     const current = room.audioTrack; room.audioTrack = null;
@@ -245,7 +248,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         }
         state(room, { ...room.state, paused, buffering, audio }); audioTimer(room);
       };
-      room.audioTrack = { stream, onProgress }; stream.events.on('progress', onProgress);
+      room.audioTrack = { stream, onProgress, pick }; stream.events.on('progress', onProgress);
       state(room, { phase: 'listen', title: pick.title, roundId: 'audio:' + stream.id, video: null, answer: null, paused: false, scores: [],
         audio: { ...stream.status, id: stream.id, title: pick.title, url: '/api/rooms/' + room.id + '/audio/' + stream.id,
           duration: pick.duration, bitDepth: pick.bitDepth, sampleRate: pick.sampleRate, startSeconds: pick.handoffPosition || 0, startedAt: null } });
@@ -303,11 +306,29 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
   };
   const advance = async room => {
     if (room.starting || room.advancing) return;
-    if (!room.queue.size) { if (room.audioTrack) endAudio(room); else endWatch(room); return; }
+    clearTimeout(room.memoryRetryTimer); room.memoryRetryTimer = null;
+    if (!room.queue.size) {
+      if (room.batchJob && !room.batchJob.controller.signal.aborted) {
+        const epoch = room.queueEpoch;
+        clearWatch(room); await clearAudio(room);
+        if (epoch !== room.queueEpoch || room.audioTrack || room.watch || room.starting) return;
+        state(room, { phase: 'waiting', title: '입력한 다음 곡을 찾는 중', roundId: null, audio: null, video: null, answer: null, paused: false, scores: [] });
+        // A search may have completed while the previous audio was released.
+        if (room.queue.size) finishPlayback(room);
+      } else if (room.audioTrack) endAudio(room); else endWatch(room);
+      return;
+    }
     room.advancing = true; const epoch = room.queueEpoch;
     try {
       const queued = room.queue.next;
       const prepared = queued?.kind === 'listen' && queued.buffered && !queued.failed && queued.stream;
+      if (resources.compact && queued?.kind === 'listen' && !prepared && !memoryWorkAllowed(96 * 1024 ** 2)) {
+        clearWatch(room); await clearAudio(room);
+        if (epoch !== room.queueEpoch) return;
+        state(room, { phase: 'loading', title: '서버 여유를 기다리는 중 · 예약은 유지됩니다', roundId: null, audio: null, video: null, answer: null, paused: false, scores: [] });
+        room.memoryRetryTimer = setTimeout(() => { void advance(room).catch(error => console.warn('[lossless] 예약 재개:', error.message)); }, 2000);
+        room.memoryRetryTimer.unref(); return;
+      }
       room.transitionAudio = prepared ? queued.stream.id : null;
       const cleanup = clearAudio(room); clearWatch(room);
       state(room, { phase: 'loading', title: '예약한 다음 곡 준비 중', roundId: null, audio: null, video: null, answer: null, paused: false, scores: [] });
@@ -335,7 +356,10 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         } catch (error) { if (epoch !== room.queueEpoch) return; broadcast(room, { type: 'error', message: error.message }); }
         finally { await room.queue.release(item).catch(error => console.warn('[lossless] 예약 캐시 정리:', error.message)); }
       }
-      if (epoch === room.queueEpoch) endWatch(room);
+      if (epoch === room.queueEpoch) {
+        if (room.batchJob && !room.batchJob.controller.signal.aborted) state(room, { phase: 'waiting', title: '입력한 다음 곡을 찾는 중', roundId: null, audio: null, video: null, answer: null, paused: false, scores: [] });
+        else endWatch(room);
+      }
     } finally {
       room.transitionAudio = null; room.advancing = false; state(room, room.state); room.queue.prime();
       const pending = room.endPending; room.endPending = null;
@@ -582,7 +606,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
     }
   });
   server.requestTimeout = 20_000;
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   server.on('upgrade', (req, socket, head) => {
     try {
       const url = new URL(req.url, 'http://localhost');
@@ -632,6 +656,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           send(ws, { type: 'joined', resumeToken: player.token, name: player.name, host,
             voiceName: room.voiceChannel.name, discordChannelUrl: entryChannelUrl(room), shareUrl: `${baseUrl}/r/${room.id}` });
           send(ws, { type: 'state', ...room.state, preparing: Boolean(room.starting || room.advancing), revision: room.revision, serverTime: Date.now() });
+          if (room.batchStatus) send(ws, { type: 'batchMusic', ...room.batchStatus });
           presence(room); return;
         }
         if (!player) throw new Error('먼저 방에 참가해주세요.');
@@ -653,6 +678,41 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           void lossless.warmup?.().catch(() => {}); return;
         }
         if (message.type === 'cancelFlac') { cancelHandoff(room); return; }
+        if (message.type === 'cancelBatchMusic') { cancelBatch(room); return; }
+        if (message.type === 'queueBatchMusic') {
+          if (room.session || room.startJob?.kind === 'quiz' || busy(room.guildId) || isRadioActive(room.guildId)) throw new Error('음악 감상이나 웹 유튜브 방에서 예약해주세요.');
+          if (room.batchJob) throw new Error('여러 곡을 찾고 있습니다. 완료하거나 취소한 뒤 다시 추가해주세요.');
+          const queries = parseBatchQueries(message.text);
+          const job = { controller: new AbortController() }; room.batchJob = job;
+          const known = new Set();
+          const run = runBatchMusic({ queries, signal: job.controller.signal,
+            canRun: () => !room.starting && !room.advancing && memoryWorkAllowed(96 * 1024 ** 2) && (lossless.canPrefetch?.() ?? true),
+            find: (query, options) => findBatchTrack(query, (q, opts) => lossless.search(q, opts), { ...options, identifySong: musicIdentity }),
+            enqueue: pick => {
+              job.controller.signal.throwIfAborted();
+              if (known.has(pick.id) || room.audioTrack?.pick?.id === pick.id) return false;
+              known.add(pick.id);
+              const { added } = room.queue.addMany('listen', [{ ...pick, waitForComplete: message.playbackMode === 'verified' }]);
+              if (!room.audioTrack && !room.watch && !room.starting && !room.advancing && room.queue.size) finishPlayback(room);
+              return Boolean(added);
+            },
+            publish: value => {
+              if (room.batchJob !== job) return;
+              room.batchStatus = value; room.touchedAt = Date.now(); broadcast(room, { type: 'batchMusic', ...value });
+            },
+          });
+          job.done = run.catch(() => {
+            broadcast(room, { type: 'error', message: '여러 곡 검색이 중단됐습니다. 다시 시도해주세요.' });
+          }).finally(() => {
+            if (room.batchJob !== job) return;
+            room.batchJob = null;
+            if (!room.session && !busy(room.guildId) && !isRadioActive(room.guildId) && !room.audioTrack && !room.watch && !room.starting && !room.advancing) {
+              if (!job.controller.signal.aborted) finishPlayback(room);
+              else if (room.state.phase === 'waiting') state(room, { ...room.state, title: room.title });
+            }
+          });
+          return;
+        }
         // Multiple participants may report the old track's end after another
         // participant or the room timer has already promoted its successor.
         if (message.type === 'audioEnded' && (room.state.phase !== 'listen' || message.roundId !== room.state.roundId)) return;
@@ -677,7 +737,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
           return;
         }
         if (message.type === 'queueRemove') { await room.queue.remove(message.id); return; }
-        if (message.type === 'queueClear') { await room.queue.clear(); return; }
+        if (message.type === 'queueClear') { cancelBatch(room); await room.queue.clear(); return; }
         if (message.type === 'next' && !room.session) {
           if ((!room.audioTrack && !room.watch) || message.roundId !== room.state.roundId || message.phase !== room.state.phase) throw new Error('곡이 바뀌었습니다. 다시 눌러주세요.');
           if (room.starting || room.advancing) throw new Error('다음 곡을 준비하고 있습니다.');
@@ -835,7 +895,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
         players: new Map(), clients: new Map(), discordEntries: new Map(), videoPicks: new Map(), trackPicks: new Map(), albumPicks: new Map(), replyCleanups: new Set(), revision: 0, touchedAt: Date.now(), starting: false, queueEpoch: 0,
         state: { phase: 'waiting', title, index: 0, total: 0, roundId: null, answer: null, video: null, scores: [] } };
       const created = room;
-      room.queue = createPlaybackQueue({ lossless, ownerPrefix: `queue:${room.id}`, onChange: () => state(created, created.state) });
+      room.queue = createPlaybackQueue({ lossless, ownerPrefix: `queue:${room.id}`, canPrime: () => !resources.compact || (!created.starting && !created.advancing && (lossless.canPrefetch?.() ?? true)), onChange: () => state(created, created.state) });
       rooms.set(room.id, room); guildRooms.set(guildId, room);
       const active = getSession(guildId); if (attachCurrent && active) attach(active);
     }
@@ -901,7 +961,7 @@ export function createQuizWebServer({ env = {}, requireDiscordIdentity = true, i
       return local;
     },
     async close() {
-      clearInterval(heartbeat); events.off('start', attach); events.off('end', finish);
+      offPressure(); clearInterval(heartbeat); events.off('start', attach); events.off('end', finish);
       const replyCleanups = [];
       for (const room of rooms.values()) { room.detach?.(); clearWatch(room); await clearQueue(room); await clearAudio(room); replyCleanups.push(...room.replyCleanups); room.replyCleanups.clear(); }
       await lossless.close();

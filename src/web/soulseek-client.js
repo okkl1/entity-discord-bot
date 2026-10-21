@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSoulseekSearchEvents } from './soulseek-search-events.js';
-import { resources, onMemoryPressure } from '../resource-profile.js';
+import { resources, onMemoryPressure, memoryWorkAllowed } from '../resource-profile.js';
+import { WorkLimiter } from '../work-limiter.js';
 const compareTracks = (a, b) => Number(b.freeSlot) - Number(a.freeSlot) || a.queueLength - b.queueLength || b.uploadSpeed - a.uploadSpeed;
 
 function requestError(status, body, path) {
@@ -60,18 +61,28 @@ export class SoulseekClient {
   constructor({ baseUrl, apiKey, fetchImpl = fetch, searchMs = 7000, extendedSearchMs = searchMs * 2, pollMs = 250,
     minSearchMs = 1500, settleMs = 500, minHits = 10, matchMs = 500,
     now = Date.now, sleep = delay, searchEvents, loginFailure = async () => null, loginWaitMs = 20_000,
-    cacheMaxTracks = resources.searchCacheTracks, cacheMaxEntries = resources.searchCacheEntries }) {
+    cacheMaxTracks = resources.searchCacheTracks, cacheMaxEntries = resources.searchCacheEntries,
+    searchConcurrency = resources.compact ? 1 : 2 }) {
     this.baseUrl = baseUrl.replace(/\/$/, ''); this.apiKey = apiKey; this.fetch = fetchImpl; this.searchMs = searchMs;
     this.extendedSearchMs = Math.max(searchMs, extendedSearchMs);
     this.pollMs = pollMs; this.minSearchMs = minSearchMs; this.settleMs = settleMs; this.minHits = minHits; this.matchMs = matchMs;
     this.now = now; this.sleep = sleep; this.pending = new Map(); this.cache = new Map(); this.controller = new AbortController();
     this.searchEvents = searchEvents === false ? null : searchEvents ?? createSoulseekSearchEvents({ baseUrl: this.baseUrl, apiKey });
     this.posts = Promise.resolve(); this.cleanups = new Set();
+    this.searchSlots = new WorkLimiter(searchConcurrency);
     this.loginFailure = loginFailure;
     this.loginWaitMs = loginWaitMs;
     this.cacheMaxTracks = cacheMaxTracks; this.cacheMaxEntries = cacheMaxEntries;
     this.pruneTimer = setInterval(() => this.pruneCache(), 30_000); this.pruneTimer.unref();
-    this.offPressure = onMemoryPressure(() => this.pruneCache(Math.min(this.cacheMaxTracks, 2000)));
+    this.offPressure = onMemoryPressure(detail => {
+      this.pruneCache(Math.min(this.cacheMaxTracks, 2000));
+      if (!resources.compact || !detail?.level) return;
+      for (const job of this.pending.values()) {
+        const error = new Error('서버 메모리 여유가 부족해 검색을 멈췄습니다. 현재 재생을 유지하며 잠시 후 다시 검색해주세요.');
+        for (const waiter of [...job.waiters]) this.finishWaiter(job, waiter, job.hits?.length ? job.hits : null, job.hits?.length ? null : error);
+        job.controller.abort(error);
+      }
+    });
   }
   pruneCache(maxTracks = this.cacheMaxTracks) {
     for (const [key, value] of this.cache) if (value.until <= this.now()) this.cache.delete(key);
@@ -181,9 +192,11 @@ export class SoulseekClient {
   async runSearch(job) {
     const { id } = job, signal = AbortSignal.any([job.controller.signal, this.controller.signal]);
     let created = false, unsubscribe, complete = false, extended = false, partial = false, hits = [], changedAt = 0, statusReadError;
-    const responses = new Map(); let responseRevision = 0, normalizedRevision = -1;
+    const responses = new Map(); let responseRevision = 0, normalizedRevision = -1, releaseSlot;
     try {
+      releaseSlot = await this.searchSlots.acquire({ signal });
       signal.throwIfAborted();
+      if (!memoryWorkAllowed(96 * 1024 ** 2)) throw new Error('서버 메모리 여유를 기다리고 있습니다. 잠시 후 다시 검색해주세요.');
       // The local API can become ready before the Soulseek login finishes.
       await this.waitForLogin(signal);
       unsubscribe = await this.searchEvents?.subscribe(id, peer => {
@@ -283,8 +296,8 @@ export class SoulseekClient {
           const ended = complete || await this.stopSearch(id);
           if (ended) await this.request(`/searches/${id}`, { method: 'DELETE', timeoutMs: 2000 });
         })().catch(() => {});
-        this.cleanups.add(cleanup); void cleanup.finally(() => this.cleanups.delete(cleanup));
-      }
+        this.cleanups.add(cleanup); void cleanup.finally(() => { this.cleanups.delete(cleanup); releaseSlot?.(); });
+      } else releaseSlot?.();
     }
   }
   async stopSearch(id, signal) {

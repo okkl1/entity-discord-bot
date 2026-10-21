@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
-export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {} }) {
-  let entries = [];
+export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}, canPrime = () => true, retryMs = 2000 }) {
+  let entries = [], retryTimer;
+  const retiring = new Set();
   const snapshot = () => entries.map(item => ({ id: item.id, kind: item.kind, title: item.pick.title,
     status: item.status, percent: item.percent || 0, bitDepth: item.pick.bitDepth, sampleRate: item.pick.sampleRate }));
   async function release(item) {
@@ -10,7 +11,12 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
     if (item.stream) { if (item.onProgress) item.stream.events.off('progress', item.onProgress); await lossless.release(item.stream.id, item.owner); }
   }
   function prime() {
+    clearTimeout(retryTimer); retryTimer = null;
     const item = entries[0]; if (!item || item.kind !== 'listen' || item.pending) return;
+    if (!canPrime()) {
+      if (item.status !== 'deferred') { item.status = 'deferred'; onChange(); }
+      retryTimer = setTimeout(prime, retryMs); retryTimer.unref(); return;
+    }
     item.status = 'preparing'; onChange();
     item.pending = (async () => {
       try {
@@ -33,6 +39,15 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
     })();
   }
   return { snapshot, prime,
+    defer() {
+      clearTimeout(retryTimer); retryTimer = null;
+      const item = entries[0]; if (!item || item.kind !== 'listen' || item.claimed || !item.pending ||
+        (item.failed && item.stream?.error?.code !== 'LOSSLESS_MEMORY_PRESSURE') || item.stream?.complete) return;
+      entries[0] = { id: item.id, kind: item.kind, pick: item.pick, status: 'deferred', owner: `${ownerPrefix}:${randomUUID()}` };
+      const cleanup = release(item).catch(() => {}); retiring.add(cleanup);
+      void cleanup.finally(() => { retiring.delete(cleanup); prime(); });
+      onChange();
+    },
     get size() { return entries.length; },
     get next() { return entries[0] || null; },
     add(kind, pick) {
@@ -50,9 +65,9 @@ export function createPlaybackQueue({ lossless, ownerPrefix, onChange = () => {}
       if (added) { onChange(); prime(); }
       return { added, skipped: picks.length - added };
     },
-    async take() { const item = entries.shift(); if (!item) return null; item.claimed = true; onChange(); await item.pending; return item; },
+    async take() { clearTimeout(retryTimer); retryTimer = null; const item = entries.shift(); if (!item) return null; item.claimed = true; onChange(); await item.pending; return item; },
     async remove(id) { const item = entries.find(i => i.id === id); if (!item) throw new Error('예약 목록이 바뀌었습니다.'); entries = entries.filter(i => i !== item); onChange(); await release(item); prime(); },
-    async clear() { const previous = entries; entries = []; if (previous.length) onChange(); await Promise.allSettled(previous.map(release)); },
+    async clear() { clearTimeout(retryTimer); retryTimer = null; const previous = entries; entries = []; if (previous.length) onChange(); await Promise.allSettled([...previous.map(release), ...retiring]); },
     release,
   };
 }

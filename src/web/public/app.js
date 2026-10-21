@@ -5,7 +5,7 @@ import { readTrackSearchResponse } from './track-search-response.js';
 import { createRoomConnection } from './room-connection.js';
 
 const $ = id => document.getElementById(id);
-for (const form of document.querySelectorAll('form')) protectComposition(form);
+for (const form of document.querySelectorAll('form:not(#batch-music-form)')) protectComposition(form);
 const roomId = /^\/r\/([\w-]+)$/.exec(location.pathname)?.[1];
 const providedHostToken = new URLSearchParams(location.hash.slice(1)).get('host') ?? '';
 const providedJoinToken = new URLSearchParams(location.hash.slice(1)).get('join') ?? '';
@@ -31,6 +31,7 @@ function localPlaybackState(value) {
     ? { ...value, paused: true, audio: value.audio ? { ...value.audio, pausedAt: pendingPause.at } : null } : value;
 }
 let losslessConfigured = false, losslessPrepared = false;
+let batchStatus = null, batchRowsKey = '';
 const trackCards = new Map();
 const albumCards = new Map();
 let mode = new URLSearchParams(location.search).get('mode') === 'watch' ? 'watch' : 'quiz';
@@ -83,6 +84,30 @@ const videoPosition = () => !state?.video ? 0 : state.video.startSeconds + Math.
 const browserAudioAllowed = () => joined && ['reveal', 'watch'].includes(state?.phase);
 
 function textElement(tag, text, className) { const el = document.createElement(tag); el.textContent = text; if (className) el.className = className; return el; }
+function renderBatchMusic(value = batchStatus) {
+  batchStatus = value;
+  const active = value && ['searching', 'waiting'].includes(value.status);
+  $('batch-music-start').disabled = !joined || Boolean(active);
+  $('batch-music-cancel').disabled = !joined || !active;
+  if (!value) return;
+  const label = { searching: '곡을 찾는 중', waiting: '현재 곡 준비·서버 여유를 기다리는 중', done: '검색 완료', cancelled: '남은 검색 취소됨' }[value.status] || '';
+  $('batch-music-status').textContent = `${label} · ${value.processed}/${value.total}곡 확인 · ${value.added}곡 예약${value.query ? ` · ${value.query}` : ''}`;
+  const key = JSON.stringify(value.rows);
+  if (key === batchRowsKey) return;
+  batchRowsKey = key;
+  $('batch-music-results').replaceChildren(...(value.rows || []).map(row => textElement('li',
+    `${row.query} → ${row.status === 'added' ? `${row.title} · 예약됨` : row.status === 'duplicate' ? `${row.title} · 중복 제외` : row.message}`)));
+}
+$('batch-music-form').onsubmit = event => {
+  event.preventDefault();
+  const text = $('batch-music-input').value;
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (!lines.length || lines.length > 100 || lines.some(line => line.length < 2 || line.length > 120)) return notify('한 줄에 2~120자로, 최대 100곡을 입력해주세요.');
+  trackController?.abort();
+  losslessPlayer.enable();
+  send({ type: 'queueBatchMusic', text, playbackMode: playbackMode() });
+};
+$('batch-music-cancel').onclick = () => send({ type: 'cancelBatchMusic' });
 function updateEntryChannel(url) {
   if (typeof url !== 'string') return;
   discordChannelUrl = url; $('discord-channel-link').href = url;
@@ -105,7 +130,7 @@ function renderQueue(queue) {
   if (!queue.length) $('playback-queue').append(textElement('li', '검색 결과의 예약 버튼으로 다음 곡을 골라두세요.', 'small queue-empty'));
   for (const [index, item] of queue.entries()) {
     const row = document.createElement('li'), copy = document.createElement('div');
-    const labels = { waiting: '순서 대기', queued: '공유자 전송 대기 · 0%', preparing: `미리 받는 중 · ${item.percent}%`, verifying: '100% 수신 · 음원 검사 중', ready: `재생 준비됨 · ${item.percent}% 수신`, later: '재생할 때 준비', failed: '전송 중단 · 다음 곡에서 다른 공유자 확인' };
+    const labels = { waiting: '순서 대기', deferred: '현재 곡 수신·서버 여유를 기다리는 중', queued: '공유자 전송 대기 · 0%', preparing: `미리 받는 중 · ${item.percent}%`, verifying: '100% 수신 · 음원 검사 중', ready: `재생 준비됨 · ${item.percent}% 수신`, later: '재생할 때 준비', failed: '전송 중단 · 다음 곡에서 다른 공유자 확인' };
     copy.append(textElement('strong', `${index + 1}. ${item.title}`), textElement('small', `${item.kind === 'listen' ? 'FLAC' : '유튜브'} · ${labels[item.status] || '순서 대기'}`));
     const remove = textElement('button', '제거', 'quiet'); remove.type = 'button'; remove.disabled = !joined;
     remove.onclick = () => send({ type: 'queueRemove', id: item.id }); row.append(copy, remove); $('playback-queue').append(row);
@@ -121,6 +146,7 @@ function applyState(next) {
   revision = next.revision;
   if (roundChanged) { $('chat').replaceChildren(textElement('p', '떠오르는 제목을 가장 먼저 입력해보세요.', 'chat-empty')); $('answer').value = ''; }
   state = next;
+  renderBatchMusic();
   if (phaseChanged && ['watch', 'question', 'listen'].includes(next.phase)) selectMode(next.phase === 'listen' ? 'listen' : next.phase === 'watch' ? 'watch' : 'quiz');
   if (next.video && !player && !window.onYouTubeIframeAPIReady) prepareVideo();
   $('quiz-title').textContent = next.title || '엔티티 음악 퀴즈';
@@ -280,6 +306,7 @@ const connection = createRoomConnection({
       $('join-card').hidden = true; $('game').hidden = false; $('host-controls').hidden = false;
       $('connection').textContent = '실시간 연결됨'; $('connection').className = 'connection online';
       selectMode(mode);
+      renderBatchMusic();
     } else if (msg.type === 'entryChannel') updateEntryChannel(msg.discordChannelUrl);
     else if (msg.type === 'hostRole') { host = msg.host; if (state) applyState(state); }
     else if (msg.type === 'state') { if (bestRtt === Infinity) offset = msg.serverTime - Date.now(); applyState(msg); }
@@ -295,6 +322,7 @@ const connection = createRoomConnection({
       if (rtt <= bestRtt + 20) { bestRtt = Math.min(bestRtt, rtt); offset = msg.serverTime - (msg.sentAt + Date.now()) / 2; }
     } else if (msg.type === 'queueAck') notify(`${msg.title} · 다음 곡으로 예약했어요.`);
     else if (msg.type === 'albumQueueAck') notify(`${msg.title} · ${msg.added}곡 예약${msg.skipped ? ` · 중복 ${msg.skipped}곡 제외` : ''}`);
+    else if (msg.type === 'batchMusic') renderBatchMusic(msg);
     else if (msg.type === 'error') { clearPendingPause(); notify(msg.message); if (state) applyState(state); }
   }
 });

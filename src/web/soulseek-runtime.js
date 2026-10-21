@@ -48,7 +48,7 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
   let starting, child, client, stopping = false, exitHandler, suspending;
   const plannedStops = new WeakSet();
   const cacheRoot = join(root, 'cache');
-  async function stopChild() {
+  async function stopChild(emergency = false) {
     client?.close(); client = null;
     const launched = child; child = null;
     if (launched && launched.exitCode === null && launched.signalCode === null) {
@@ -61,7 +61,7 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
           launched.kill('SIGKILL');
           timer = setTimeout(() => { launched.off('close', done); reject(new Error('Soulseek 연결 프로그램 종료가 지연되고 있습니다.')); }, 1000);
         }, 4000);
-        launched.kill();
+        launched.kill(emergency ? 'SIGKILL' : undefined);
       });
     }
     if (exitHandler) { process.removeListener('exit', exitHandler); exitHandler = null; }
@@ -111,10 +111,12 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
           web: { port, ip_address: '127.0.0.1', https: { disabled: true }, authentication: {
             username: 'entity', password: randomBytes(24).toString('hex'), api_keys: { entity: { key: apiKey, role: 'readwrite', cidr: '127.0.0.1/32' } } } },
           soulseek: { username: value.username, password: value.password, listen_port: 2235,
-            ...(resources.compact ? { distributed_network: { disable_children: true } } : {}) },
+            ...(resources.compact ? { distributed_network: { disable_children: true },
+              connection: { buffer: { read: 8192, write: 8192, transfer: 131072, write_queue: 10 } } } : {}) },
           directories: { incomplete: join(cacheRoot, 'incomplete'), downloads: join(cacheRoot, 'complete') },
           transfers: { download: { retry: { attempts: 2 }, destination: { exists: 'overwrite' } } },
           retention: { search: 5, files: { complete: 120, incomplete: 120 } },
+          ...(resources.compact ? { throttling: { search: { incoming: { concurrency: 1, circuit_breaker: 100, response_file_limit: 500 } } } } : {}),
           logger: { no_disk: true } };
         const configPath = join(appRoot, 'slskd.yml');
         await writeFile(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -152,9 +154,10 @@ export function createSoulseekRuntime({ root = losslessRoot, settingsFile = join
       })();
       try { return await starting; } finally { starting = null; }
     },
-    async suspend() {
+    async suspend({ emergency = false } = {}) {
       if (stopping) return;
-      if (!suspending) suspending = (async () => { await starting?.catch(() => {}); await stopChild(); console.log('[soulseek] idle: stopped unused native process'); })();
+      if (emergency && child) { plannedStops.add(child); child.kill('SIGKILL'); }
+      if (!suspending) suspending = (async () => { await starting?.catch(() => {}); await stopChild(emergency); console.log(emergency ? '[soulseek] memory-protection: stopped native process' : '[soulseek] idle: stopped unused native process'); })();
       try { await suspending; } finally { suspending = null; }
     },
     async close() { stopping = true; await suspending?.catch(() => {}); await starting?.catch(() => {}); await stopChild(); },

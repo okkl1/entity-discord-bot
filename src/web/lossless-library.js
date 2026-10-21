@@ -5,7 +5,7 @@ import { resolve, relative, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSoulseekRuntime } from './soulseek-runtime.js';
 import { verifyFlacFile } from './lossless-integrity.js';
-import { resources } from '../resource-profile.js';
+import { resources, onMemoryPressure, backgroundWorkAllowed, memoryWorkAllowed } from '../resource-profile.js';
 
 const uuid = /^[a-f0-9-]{36}$/;
 const maxFile = 512 * 1024 * 1024;
@@ -50,21 +50,42 @@ export function startupBufferBytes(size, duration, speed, { initialBytes = 512 *
 }
 
 export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollMs = resources.compact ? 1000 : 250, initialBytes = 512 * 1024, initialBufferSeconds = 16,
-  idleMs = resources.compact ? 120_000 : 0,
+  idleMs = resources.compact ? 15_000 : 0,
   waitForComplete = false, verify = verifyFlacFile, verifyPrefix = (path, info, options) => verifyFlacFile(path, info, { ...options, seconds: 2 }),
   waitMs = 10 * 60_000, stallMs = 90_000, cacheLimitBytes = 512 * 1024 * 1024, minFreeBytes = (() => { const mb = Number(process.env.LOSSLESS_MIN_FREE_MB); return Number.isFinite(mb) && mb >= 0 && process.env.LOSSLESS_MIN_FREE_MB !== undefined ? mb * 1024 ** 2 : 2 * 1024 ** 3; })(),
   freeSpace = async path => { const disk = await statfs(path); return disk.bavail * disk.bsize; } } = {}) {
   const root = resolve(runtime.cacheRoot), streams = new Map(), keys = new Map(); let initialized, client, closing = false;
-  let activeOperations = 0, idleTimer, suspending;
+  let activeOperations = 0, idleTimer, suspending, protecting;
+  const hasIncomplete = () => [...streams.values()].some(stream => !stream.complete && !stream.disposal);
+  function suspendNative(emergency = false) {
+    if (suspending || !runtime.suspend) return suspending;
+    initialized = null; client = null;
+    suspending = Promise.resolve().then(() => runtime.suspend({ emergency })).catch(error => console.warn('[lossless] 유휴 연결 정리:', error.message));
+    return suspending;
+  }
   function armIdle() {
     clearTimeout(idleTimer);
-    if (closing || activeOperations || streams.size || !initialized || !runtime.suspend || !(idleMs > 0)) return;
+    if (closing || activeOperations || hasIncomplete() || !initialized || !runtime.suspend || !(idleMs > 0)) return;
     idleTimer = setTimeout(() => {
-      if (closing || activeOperations || streams.size) return;
-      initialized = null; client = null;
-      suspending = runtime.suspend().catch(error => console.warn('[lossless] 유휴 연결 정리:', error.message));
+      if (closing || activeOperations || hasIncomplete()) return;
+      suspendNative();
     }, idleMs); idleTimer.unref();
   }
+  const offPressure = onMemoryPressure(detail => {
+    if (!resources.compact || !detail?.level || closing) return;
+    if (!hasIncomplete() && !activeOperations) { if (initialized) suspendNative(detail.level === 'critical'); return; }
+    if (detail.level !== 'critical' || protecting || !runtime.suspend) return;
+    const interrupted = [...streams.values()].filter(stream => !stream.complete && !stream.disposal);
+    const error = Object.assign(new Error('서버 메모리 보호를 위해 음원 수신을 중단했습니다. 잠시 후 다시 선택해주세요.'), { code: 'LOSSLESS_MEMORY_PRESSURE' });
+    for (const stream of interrupted) {
+      stream.error = error; stream.rejectReady(error); stream.rejectVerified(error);
+      update(stream, { status: 'error', message: error.message }); stream.controller.abort(error);
+    }
+    // Completed files remain owned by their listeners and keep streaming. Only
+    // the native worker and unfinished downloads are stopped before an OOM kill.
+    console.warn('[lossless] memory protection: stopping native worker; completed audio retained');
+    protecting = Promise.resolve(suspendNative(true)).then(() => Promise.allSettled(interrupted.map(dispose))).finally(() => { protecting = null; });
+  });
   async function operate(task) {
     activeOperations++; clearTimeout(idleTimer);
     try { return await task(); } finally { activeOperations--; armIdle(); }
@@ -97,13 +118,18 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
     await remove(paths.manifest);
   }
   async function initialize() {
+    if (protecting) await protecting;
     if (suspending) { await suspending; suspending = null; }
     if (closing) throw new Error('음악 서비스를 종료하고 있습니다.');
     if (client?.controller?.signal.aborted) { initialized = null; client = null; }
     if (initialized) return initialized;
+    if (!memoryWorkAllowed(96 * 1024 ** 2)) throw new Error('서버 메모리 여유를 기다리고 있습니다. 잠시 후 다시 시도해주세요.');
     initialized = (async () => {
       client = await runtime.start(); await mkdir(join(root, 'manifests'), { recursive: true });
       for (const name of await readdir(join(root, 'manifests'))) if (/^[a-f0-9-]{36}\.json$/.test(name)) {
+        // A stopped native worker can restart while completed FLACs are still
+        // being served. Recovery must never delete those live cache files.
+        if (streams.has(name.slice(0, -5))) continue;
         const record = JSON.parse(await readFile(await checkedPath(join(root, 'manifests', name)), 'utf8'));
         if (record.id + '.json' !== name) throw new Error('임시 음원 기록이 손상됐습니다.');
         await clean(record);
@@ -227,14 +253,18 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
   }
   return {
     configured: () => runtime.configured(),
+    canPrefetch: () => !closing && !protecting && backgroundWorkAllowed() && !hasIncomplete() && !activeOperations && !client?.searching && !client?.cleanups?.size,
     warmup() { return operate(async () => { if (!closing && await runtime.configured()) await initialize(); }); },
     search(query, options) { return operate(async () => { await initialize(); if (closing) throw new Error('음악 서비스를 종료하고 있습니다.'); return client.search(query, options); }); },
     acquire(track, owner) { return operate(async () => {
       if (closing) throw new Error('음악 서비스를 종료하고 있습니다.');
       if (!Number.isSafeInteger(track.size) || track.size < 42 || track.size > maxFile) throw new Error('음원 파일 크기를 확인해주세요.');
+      const key = `${track.username}\0${track.filename}`; let stream = keys.get(key);
+      // A ready reservation changes owners without waking the native worker.
+      if (stream && !stream.disposal && !stream.error) { stream.owners.add(owner); return stream; }
       await initialize();
       if (closing) throw new Error('음악 서비스를 종료하고 있습니다.');
-      const key = `${track.username}\0${track.filename}`; let stream = keys.get(key);
+      stream = keys.get(key);
       if (stream && !stream.disposal && !stream.error) { stream.owners.add(owner); return stream; }
       if (stream) {
         await dispose(stream);
@@ -266,7 +296,7 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
         // Failed prefetched songs must not retain partial files until their turn
         // in the queue. Do not await disposal here: it awaits this receive task.
         queueMicrotask(() => { void dispose(stream).catch(error => console.warn('[lossless] 실패한 음원 캐시 정리:', error.message)); });
-      });
+      }).finally(armIdle);
       return stream;
     }); },
     async release(id, owner) {
@@ -323,6 +353,6 @@ export function createLosslessLibrary({ runtime = createSoulseekRuntime(), pollM
         else if (!res.destroyed) res.destroy();
       } finally { await handle?.close().catch(() => {}); stream.responses.delete(res); }
     },
-    async close() { closing = true; clearTimeout(idleTimer); await suspending?.catch(() => {}); await initialized?.catch(() => {}); await Promise.allSettled([...streams.values()].map(dispose)); client?.close?.(); await runtime.close(); },
+    async close() { closing = true; offPressure(); clearTimeout(idleTimer); await protecting?.catch(() => {}); await suspending?.catch(() => {}); await initialized?.catch(() => {}); await Promise.allSettled([...streams.values()].map(dispose)); client?.close?.(); await runtime.close(); },
   };
 }

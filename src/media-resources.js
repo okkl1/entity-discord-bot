@@ -3,7 +3,7 @@ import { resources } from './resource-profile.js';
 import { trackMemoryProcess } from './runtime-memory.js';
 
 export const extractionSlots = new WorkLimiter(resources.compact ? 1 : 2);
-export const transcodeSlots = new WorkLimiter(resources.compact ? 2 : Infinity);
+export const transcodeSlots = new WorkLimiter(resources.compact ? 1 : Infinity);
 export async function acquireTranscode(options) {
   const release = await transcodeSlots.acquire(options);
   try { options?.signal?.throwIfAborted(); return release; }
